@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bun add *)",
+      "Bash(bunx tsc *)",
+      "Bash(timeout 5 bun run src/index.ts)",
+      "Bash(bun -e ' *)",
+      "Bash(netstat -ano)",
+      "Bash(taskkill /F /PID 81012 /PID 266308 /PID 2356 /PID 297996 /PID 318952 /PID 313164 /PID 22104 /PID 13408 /PID 315436 /PID 7192 /PID 286388 /PID 144332 /PID 79588 /PID 178816)",
+      "PowerShell($pids = @\\(81012, 266308, 2356, 297996, 318952, 313164, 22104, 13408, 315436, 7192, 286388, 144332, 79588, 178816\\); foreach \\($p in $pids\\) { try { Stop-Process -Id $p -Force -ErrorAction Stop; \"Killed $p\" } catch { \"Failed $p`: $\\($_.Exception.Message\\)\" } })",
+      "Bash(grep -n \"nurse\\\\.\" g:\\\\\\\\bunjs\\\\\\\\nurse-pg\\\\\\\\src\\\\\\\\controllers\\\\\\\\nurseController.ts)",
+      "PowerShell(bun x tsc --noEmit -p tsconfig.json 2>&1)",
+      "Bash(bun x *)",
+      "Bash(echo \"exit=$?\")"
+    ]
+  }
+}
