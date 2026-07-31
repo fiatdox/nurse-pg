@@ -7,7 +7,8 @@ import {
     getFoodOrdersByWard,
     getFoodOrdersAddonByWard,
     updateFoodOrderAddon,
-    cancelOrderMenu
+    cancelOrderMenu,
+    getFoodOrderHistoryByAN
 } from '../controllers/nutritionController';
 
 export const nutritionRoutes = new Elysia({ prefix: '/api/v1/nutrition' })
@@ -50,6 +51,13 @@ export const nutritionRoutes = new Elysia({ prefix: '/api/v1/nutrition' })
                 addon: t.Optional(t.Union([t.String(), t.Null()]))
             }))
         })
+    })
+    .post('/food-order-history', getFoodOrderHistoryByAN, {
+        body: t.Object({
+            an: t.String(),
+            days: t.Optional(t.Number())
+        }),
+        detail: { summary: 'ประวัติการสั่งอาหารรายผู้ป่วย ย้อนหลังตามจำนวนวันที่ระบุ (ค่าเริ่มต้น 7 วัน)' }
     })
     .post('/cancel-order-menu', cancelOrderMenu, {
         body: t.Array(t.Object({

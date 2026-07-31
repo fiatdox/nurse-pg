@@ -61,7 +61,7 @@ export const patientRoutes = new Elysia({ prefix: '/api/v1/patients' })
             before_ward: nullableString,
             birth_date: nullableString,
             spclty: nullableString,
-            gender: t.Optional(t.String()),
+            gender: nullableString,
             bedno: nullableString,
             admission_type_id: nullableNumber,
             status: t.Optional(t.Union([t.Number(), t.String()])),

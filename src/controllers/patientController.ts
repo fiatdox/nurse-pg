@@ -649,11 +649,13 @@ export const getPatientsBYAN = async ({ body, set }: Context) => {
     try {
         const [rows] = await his.execute<RowDataPacket[]>(
             `select i.an,i.hn,i.dchstts,CONCAT(p.pname,p.fname,' ',p.lname)as ptname
-            ,concat(i.regdate,' ',i.regtime)as regdate,p.birthday,p.sex,a.bedno ,d.name  as doctor_name,i.ward,p.sex as gender
+            ,concat(i.regdate,' ',i.regtime)as regdate,p.birthday,p.sex,a.bedno ,d.name  as doctor_name
+            ,i.ward,w.name as ward_name,p.sex as gender
             from ipt i
             left join patient p on p.hn=i.hn
             LEFT join iptadm a on a.an=i.an
             left join doctor d on d.code=i.incharge_doctor
+            left join ward w on w.ward=i.ward
             where i.an = ? limit 1`,
             [an]
         );
@@ -663,7 +665,8 @@ export const getPatientsBYAN = async ({ body, set }: Context) => {
             data: rows.map(row => ({
                 ...row,
                 ptname: sanitizeHTML(row.ptname),
-                doctor_name: sanitizeHTML(row.doctor_name)
+                doctor_name: sanitizeHTML(row.doctor_name),
+                ward_name: sanitizeHTML(row.ward_name)
             }))
         };
     } catch (error) {

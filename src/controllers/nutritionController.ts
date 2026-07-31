@@ -109,17 +109,32 @@ export const getFoodOrdersByWard = async ({ body, set }: { body: { ward: string,
                     WHERE fo.an = al.an AND fo.order_date = ${date} AND fo.meal = 1
                 ) AS breakfast,
                 (
+                    SELECT NULLIF(TRIM(fo.addon), '')
+                    FROM food_orders fo
+                    WHERE fo.an = al.an AND fo.order_date = ${date} AND fo.meal = 1
+                ) AS breakfast_addon,
+                (
                     SELECT fi.food_name
                     FROM food_orders fo
                     JOIN food_items fi ON fo.food_item_id = fi.food_item_id
                     WHERE fo.an = al.an AND fo.order_date = ${date} AND fo.meal = 2
                 ) AS lunch,
                 (
+                    SELECT NULLIF(TRIM(fo.addon), '')
+                    FROM food_orders fo
+                    WHERE fo.an = al.an AND fo.order_date = ${date} AND fo.meal = 2
+                ) AS lunch_addon,
+                (
                     SELECT fi.food_name
                     FROM food_orders fo
                     JOIN food_items fi ON fo.food_item_id = fi.food_item_id
                     WHERE fo.an = al.an AND fo.order_date = ${date} AND fo.meal = 3
-                ) AS dinner
+                ) AS dinner,
+                (
+                    SELECT NULLIF(TRIM(fo.addon), '')
+                    FROM food_orders fo
+                    WHERE fo.an = al.an AND fo.order_date = ${date} AND fo.meal = 3
+                ) AS dinner_addon
             FROM admission_list al
             WHERE al.discharge_type_id = 0 AND al.ward = ${ward}
             ORDER BY al.bedno ASC
@@ -129,7 +144,11 @@ export const getFoodOrdersByWard = async ({ body, set }: { body: { ward: string,
             success: true,
             data: rows.map(row => ({
                 ...row,
-                patient_name: sanitizeHTML(row.patient_name)
+                patient_name: sanitizeHTML(row.patient_name),
+                // addon เป็นข้อความอิสระที่ผู้ใช้พิมพ์ ต้องล้างแท็กก่อนส่งออก
+                breakfast_addon: sanitizeHTML(row.breakfast_addon),
+                lunch_addon: sanitizeHTML(row.lunch_addon),
+                dinner_addon: sanitizeHTML(row.dinner_addon)
             }))
         };
     } catch (error) {
@@ -233,6 +252,57 @@ export const cancelOrderMenu = async ({ body, set }: { body: any[], set: any }) 
         };
     } catch (error) {
         console.error('Cancel order menu error:', error);
+        set.status = 500;
+        return { success: false, message: 'Internal Server Error' };
+    }
+};
+
+// ฟังก์ชันดึงประวัติการสั่งอาหารรายผู้ป่วย ย้อนหลังตามจำนวนวันที่ระบุ
+export const getFoodOrderHistoryByAN = async ({ body, set }: { body: { an: string, days?: number }, set: any }) => {
+    const { an, days } = body;
+
+    if (!an || !an.trim()) {
+        set.status = 400;
+        return { success: false, message: 'กรุณาระบุ an' };
+    }
+
+    // จำกัดช่วงย้อนหลังไม่เกิน 90 วัน กัน query ที่กว้างเกินจำเป็น
+    const lookback = Math.min(Math.max(Number(days) || 7, 1), 90);
+
+    try {
+        const rows = await nurse`
+            SELECT
+                 fo.food_order_id
+                ,TO_CHAR(fo.order_date, 'YYYY-MM-DD') AS order_date
+                ,fo.meal
+                ,m.name AS meal_name
+                ,fi.food_name
+                ,fo.addon
+                ,fo.ward
+                ,fo.create_datetime
+            FROM food_orders fo
+            JOIN meal m ON m.meal = fo.meal
+            LEFT JOIN food_items fi ON fi.food_item_id = fo.food_item_id
+            WHERE fo.an = ${an.trim()}
+              AND fo.order_date > CURRENT_DATE - ${lookback}::int
+              AND fo.order_date <= CURRENT_DATE
+            ORDER BY fo.order_date DESC, fo.meal ASC
+        `;
+
+        return {
+            success: true,
+            data: rows.map(row => ({
+                foodOrderId: row.food_order_id,
+                orderDate: row.order_date,
+                meal: row.meal,
+                mealName: sanitizeHTML(row.meal_name),
+                foodName: sanitizeHTML(row.food_name),
+                addon: sanitizeHTML(row.addon),
+                ward: row.ward,
+            }))
+        };
+    } catch (error) {
+        console.error('Get food order history error:', error);
         set.status = 500;
         return { success: false, message: 'Internal Server Error' };
     }
