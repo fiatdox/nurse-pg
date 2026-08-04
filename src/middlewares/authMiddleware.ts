@@ -29,7 +29,7 @@ export const authMiddleware = (app: Elysia) =>
             // Properly verify JWT with expiration check enabled
             const userPayload = await jwt.verify(token);
             return {
-                user: userPayload as { loginname: string; name: string } | null
+                user: userPayload as { username: string } | null
             };
         } catch {
             // Token is invalid or expired

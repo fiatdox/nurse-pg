@@ -146,7 +146,7 @@ export const saveAdmitRecord = async ({ body, set, user }: Context & { user: any
         return { success: false, message: 'กรุณาระบุ ward_code' };
     }
 
-    const actor = String(user?.loginname ?? payload.staff_id ?? '') || null;
+    const actor = String(user?.username ?? payload.staff_id ?? '') || null;
 
     // รับเฉพาะคอลัมน์ที่รู้จัก และแปลงค่าว่างเป็น null ให้ตรงกับชนิดคอลัมน์
     const values: Record<string, unknown> = {};

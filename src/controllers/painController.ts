@@ -1,11 +1,13 @@
 import type { Context } from 'elysia';
 import { nurse } from '../db';
 import { sanitizeHTML } from '../utils/sanitize';
+import { toLocalDate, shiftOfTime } from '../utils/nursingRecord';
 
 /** คอลัมน์ที่รับบันทึกได้จาก client — ฟิลด์นอกรายการนี้จะถูกตัดทิ้ง */
 const PAIN_FIELDS = [
     'ward_code', 'ward_name', 'staff_id', 'nurse_name', 'record_datetime',
-    'shift', 'assessment_tool', 'pain_score',
+    // ไม่มี shift — เวรเป็นผลของ record_datetime ไม่ใช่ค่าที่เลือกเอง
+    'assessment_tool', 'pain_score',
     'location', 'character', 'onset', 'duration',
     'aggravating', 'alleviating', 'intervention',
     'reassess_score', 'reassess_time',
@@ -26,26 +28,6 @@ const sanitizeRow = (row: Record<string, unknown>) => {
     return out;
 };
 
-/**
- * ตีความ 'YYYY-MM-DD HH:mm:ss' ว่าเป็นเวลาท้องถิ่นตามที่ผู้ใช้กรอก
- * ถ้าส่งเป็นข้อความตรงๆ driver จะมองว่าเป็น UTC ทำให้เวลาเพี้ยนไปเท่ากับ offset ของเครื่อง
- */
-const toLocalDate = (v: unknown): Date | null => {
-    if (v === null || v === undefined || v === '') return null;
-    if (v instanceof Date) return isNaN(v.getTime()) ? null : v;
-
-    const s = String(v).trim();
-    const m = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/);
-    if (m) {
-        return new Date(
-            Number(m[1]), Number(m[2]) - 1, Number(m[3]),
-            Number(m[4] ?? 0), Number(m[5] ?? 0), Number(m[6] ?? 0)
-        );
-    }
-    const d = new Date(s);
-    return isNaN(d.getTime()) ? null : d;
-};
-
 /** ระดับความปวดตาม Numeric Rating Scale — คำนวณที่ server เพื่อให้ตรงกับคะแนนเสมอ */
 const levelOfScore = (score: number): string => {
     if (score === 0) return 'no_pain';
@@ -55,15 +37,6 @@ const levelOfScore = (score: number): string => {
     return 'worst';
 };
 
-/** เวรตามเวลาที่ประเมิน ใช้เมื่อผู้ใช้ไม่ได้เลือกเอง (คอลัมน์ shift เป็น NOT NULL) */
-const shiftOfTime = (d: Date): string => {
-    const h = d.getHours();
-    if (h < 8) return 'ดึก';
-    if (h < 16) return 'เช้า';
-    return 'บ่าย';
-};
-
-const VALID_SHIFTS = ['ดึก', 'เช้า', 'บ่าย'];
 const VALID_TOOLS = ['NRS', 'VAS', 'Wong-Baker', 'FLACC', 'BPS'];
 
 // ---------- ดึงรายการประเมินความปวดตาม AN ----------
@@ -141,10 +114,9 @@ export const savePainRecord = async ({ body, set, user }: Context & { user: any 
     }
 
     const recordDatetime = toLocalDate(payload.record_datetime) ?? new Date();
-    const shiftInput = String(payload.shift ?? '').trim();
-    const shift = VALID_SHIFTS.includes(shiftInput) ? shiftInput : shiftOfTime(recordDatetime);
+    const shift = shiftOfTime(recordDatetime);
 
-    const actor = String(user?.loginname ?? payload.staff_id ?? '') || null;
+    const actor = String(user?.username ?? payload.staff_id ?? '') || null;
 
     // รับเฉพาะคอลัมน์ที่รู้จัก และแปลงค่าว่างเป็น null ให้ตรงกับชนิดคอลัมน์
     const values: Record<string, unknown> = {};
@@ -195,7 +167,7 @@ export const deletePainRecord = async ({ params, set, user }: Context & { user: 
         return { success: false, message: 'id ไม่ถูกต้อง' };
     }
 
-    const actor = String(user?.loginname ?? '') || null;
+    const actor = String(user?.username ?? '') || null;
 
     try {
         // เก็บแถวไว้เพื่อการตรวจสอบย้อนหลัง แค่ทำเครื่องหมายว่าลบแล้ว
