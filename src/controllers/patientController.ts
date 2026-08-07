@@ -2,6 +2,7 @@ import { Context } from 'elysia';
 import { his, nurse } from '../db';
 import { RowDataPacket } from 'mysql2';
 import { sanitizeHTML } from '../utils/sanitize';
+import { resolveActor } from '../utils/nursingRecord';
 
 // ฟังก์ชันสำหรับดึงข้อมูลผู้ป่วยตาม ward
 export const getPatientsByWard = async ({ body, set }: Context) => {
@@ -484,7 +485,9 @@ export const upsertAdmissionShiftDailyRecord = async ({ body, set, user }: Conte
         ? date.split('/').reverse().join('-')
         : date;
 
-    const recorded_by = user?.id ?? null;
+    // เหมือนกับตอนยกเลิก — JWT ไม่มี id ต้องหาเลขผู้ใช้จริงเอง
+    const actor = await resolveActor(user);
+    const recorded_by = actor?.userId ? Number(actor.userId) : null;
 
     try {
         const existing = await nurse`
@@ -495,6 +498,8 @@ export const upsertAdmissionShiftDailyRecord = async ({ body, set, user }: Conte
         `;
 
         if (existing.length > 0) {
+            // ล้าง deleted_* ด้วย เพราะแถวที่เคยยกเลิกไว้ยังอยู่และติด unique key เดิม
+            // ถ้าไม่ล้าง พยาบาลที่ลบผิดแล้วจะลงข้อมูลกลับเข้าไปไม่ได้เลย
             await nurse`
                 UPDATE admission_shift_daily_record
                 SET admission_shift_care_level_id = ${careLevelId},
@@ -502,7 +507,10 @@ export const upsertAdmissionShiftDailyRecord = async ({ body, set, user }: Conte
                     hn = ${hn ?? null},
                     an = ${an ?? null},
                     updated_by = ${recorded_by},
-                    updated_at = NOW()
+                    updated_at = NOW(),
+                    deleted_at = NULL,
+                    deleted_by = NULL,
+                    delete_reason = NULL
                 WHERE admission_list_id = ${admission_list_id}
                   AND shift_type_id = ${shift_type_id}
                   AND record_date = ${parsedDate}
@@ -524,6 +532,59 @@ export const upsertAdmissionShiftDailyRecord = async ({ body, set, user }: Conte
     }
 };
 
+/**
+ * ยกเลิกรายการที่ลงผิด เช่น ติ๊กให้ผู้ป่วยที่ไม่ได้อยู่ในเวรนั้น
+ *
+ * ไม่ลบแถวทิ้ง เพราะยอดคงพยาบาลกับ FTE ของเวรนั้นถูกใช้อ้างอิงในรายงานภาระงาน
+ * ที่อาจส่งออกไปแล้ว ถ้าลบจริงจะไล่ย้อนไม่ได้ว่าตัวเลขเปลี่ยนเพราะอะไร
+ * ใช้ทำเครื่องหมาย deleted_at แทน แล้วทุก query ที่นับยอดข้ามแถวนี้ไป
+ */
+export const deleteAdmissionShiftDailyRecord = async ({ body, set, user }: Context & { user: any }) => {
+    const { admission_list_id, shift_type_id, date, reason } = body as {
+        admission_list_id: number;
+        shift_type_id: number;
+        date: string;
+        reason?: string | null;
+    };
+
+    // แปลง DD/MM/YYYY → YYYY-MM-DD
+    const parsedDate = date.includes('/')
+        ? date.split('/').reverse().join('-')
+        : date;
+
+    // JWT เก็บแค่ username ไม่มี id ต้องไปหาเลขผู้ใช้จริงจาก core_kon
+    // ถ้าใช้ user?.id ตรงๆ จะได้ undefined เสมอ แล้วไม่รู้ว่าใครเป็นคนยกเลิก
+    const actor = await resolveActor(user);
+    const deletedBy = actor?.userId ? Number(actor.userId) : null;
+    const cleanReason = (sanitizeHTML(String(reason ?? '').trim()) ?? '').slice(0, 500) || null;
+
+    try {
+        const removed = await nurse`
+            UPDATE admission_shift_daily_record
+            SET deleted_at = NOW(),
+                deleted_by = ${deletedBy},
+                delete_reason = ${cleanReason}
+            WHERE admission_list_id = ${admission_list_id}
+              AND shift_type_id = ${shift_type_id}
+              AND record_date = ${parsedDate}
+              AND deleted_at IS NULL
+            RETURNING admission_shift_daily_record
+        `;
+
+        if (removed.length === 0) {
+            // ไม่ถือเป็นข้อผิดพลาด หน้าจออาจกดซ้ำหรือรายการถูกยกเลิกไปแล้ว
+            // ปลายทางที่ต้องการคือ "ไม่มีรายการนี้แล้ว" ซึ่งก็เป็นจริงอยู่
+            return { success: true, message: 'ไม่พบรายการที่ต้องยกเลิก อาจถูกยกเลิกไปแล้ว', removed: 0 };
+        }
+
+        return { success: true, message: 'ยกเลิกรายการเรียบร้อยแล้ว', removed: removed.length };
+    } catch (error) {
+        console.error('Delete admission shift daily record error:', error);
+        set.status = 500;
+        return { success: false, message: 'Internal Server Error' };
+    }
+};
+
 // คัดลอก shift daily records จากเวร/วันที่ต้นทาง → ปลายทาง (upsert)
 export const copyPreviousShiftDailyRecords = async ({ body, set, user }: Context & { user: any }) => {
     const { ward, target_date, target_shift_type_id, source_date, source_shift_type_id } = body as {
@@ -537,7 +598,8 @@ export const copyPreviousShiftDailyRecords = async ({ body, set, user }: Context
     const parseDate = (d: string) => d.includes('/') ? d.split('/').reverse().join('-') : d;
     const parsedTargetDate = parseDate(target_date);
     const parsedSourceDate = parseDate(source_date);
-    const recorded_by = user?.id ?? null;
+    const actor = await resolveActor(user);
+    const recorded_by = actor?.userId ? Number(actor.userId) : null;
 
     try {
         const sourceRows = await nurse`
@@ -548,6 +610,7 @@ export const copyPreviousShiftDailyRecords = async ({ body, set, user }: Context
               AND al.status = '1'
               AND asdr.shift_type_id = ${source_shift_type_id}
               AND asdr.record_date = ${parsedSourceDate}
+              AND asdr.deleted_at IS NULL
         `;
 
         if (sourceRows.length === 0) {
@@ -571,7 +634,10 @@ export const copyPreviousShiftDailyRecords = async ({ body, set, user }: Context
                             hn = ${row.hn},
                             an = ${row.an},
                             updated_by = ${recorded_by},
-                            updated_at = NOW()
+                            updated_at = NOW(),
+                            deleted_at = NULL,
+                            deleted_by = NULL,
+                            delete_reason = NULL
                         WHERE admission_list_id = ${row.admission_list_id}
                           AND shift_type_id = ${target_shift_type_id}
                           AND record_date = ${parsedTargetDate}
@@ -614,17 +680,23 @@ export const getPatientShiftDailyRecordsByWard = async ({ body, set }: Context) 
                 al.an,
                 al.patient_name,
                 (SELECT asdr.admission_shift_care_level_id FROM admission_shift_daily_record asdr
-                 WHERE asdr.admission_list_id = al.admission_list_id AND asdr.shift_type_id = 1 AND asdr.record_date = ${parsedDate}) AS night_care_level,
+                 WHERE asdr.admission_list_id = al.admission_list_id AND asdr.shift_type_id = 1 AND asdr.record_date = ${parsedDate}
+                   AND asdr.deleted_at IS NULL) AS night_care_level,
                 (SELECT asdr.severity_level_id FROM admission_shift_daily_record asdr
-                 WHERE asdr.admission_list_id = al.admission_list_id AND asdr.shift_type_id = 1 AND asdr.record_date = ${parsedDate}) AS night_severity_level,
+                 WHERE asdr.admission_list_id = al.admission_list_id AND asdr.shift_type_id = 1 AND asdr.record_date = ${parsedDate}
+                   AND asdr.deleted_at IS NULL) AS night_severity_level,
                 (SELECT asdr.admission_shift_care_level_id FROM admission_shift_daily_record asdr
-                 WHERE asdr.admission_list_id = al.admission_list_id AND asdr.shift_type_id = 2 AND asdr.record_date = ${parsedDate}) AS morning_care_level,
+                 WHERE asdr.admission_list_id = al.admission_list_id AND asdr.shift_type_id = 2 AND asdr.record_date = ${parsedDate}
+                   AND asdr.deleted_at IS NULL) AS morning_care_level,
                 (SELECT asdr.severity_level_id FROM admission_shift_daily_record asdr
-                 WHERE asdr.admission_list_id = al.admission_list_id AND asdr.shift_type_id = 2 AND asdr.record_date = ${parsedDate}) AS morning_severity_level,
+                 WHERE asdr.admission_list_id = al.admission_list_id AND asdr.shift_type_id = 2 AND asdr.record_date = ${parsedDate}
+                   AND asdr.deleted_at IS NULL) AS morning_severity_level,
                 (SELECT asdr.admission_shift_care_level_id FROM admission_shift_daily_record asdr
-                 WHERE asdr.admission_list_id = al.admission_list_id AND asdr.shift_type_id = 3 AND asdr.record_date = ${parsedDate}) AS evening_care_level,
+                 WHERE asdr.admission_list_id = al.admission_list_id AND asdr.shift_type_id = 3 AND asdr.record_date = ${parsedDate}
+                   AND asdr.deleted_at IS NULL) AS evening_care_level,
                 (SELECT asdr.severity_level_id FROM admission_shift_daily_record asdr
-                 WHERE asdr.admission_list_id = al.admission_list_id AND asdr.shift_type_id = 3 AND asdr.record_date = ${parsedDate}) AS evening_severity_level
+                 WHERE asdr.admission_list_id = al.admission_list_id AND asdr.shift_type_id = 3 AND asdr.record_date = ${parsedDate}
+                   AND asdr.deleted_at IS NULL) AS evening_severity_level
             FROM admission_list al
             WHERE al.ward = ${ward} AND al.status = '1'
         `;
@@ -1001,6 +1073,7 @@ export const getPatientShiftDailyRecordsSummary = async ({ body, set }: Context)
             LEFT JOIN admission_shift_daily_record asdr
                    ON asdr.shift_type_id = acst.admission_change_shift_type_id
                   AND asdr.record_date = ${parsedDate}
+                  AND asdr.deleted_at IS NULL
             LEFT JOIN admission_list al
                    ON al.admission_list_id = asdr.admission_list_id
                   AND al.ward = ${ward}

@@ -7,7 +7,8 @@ import {
     getNurseSchedule,
     getFTEByWard,
     getNurseShiftTypes,
-    getNurseScheduleByDate
+    getNurseScheduleByDate,
+    getStaffOnDutyByDate
 } from '../controllers/nurseController';
 
 export const nurseRoutes = new Elysia({ prefix: '/api/v1/nurse' })
@@ -50,6 +51,12 @@ export const nurseRoutes = new Elysia({ prefix: '/api/v1/nurse' })
             t.Number(),
             t.Object({ shift_assignment_id: t.Number() })
         ]))
+    })
+    .post('/staff-on-duty', getStaffOnDutyByDate, {
+        body: t.Object({
+            ward: t.String(),
+            date: t.String()
+        })
     })
     .post('/fte-by-ward', getFTEByWard, {
         body: t.Object({

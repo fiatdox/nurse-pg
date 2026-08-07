@@ -63,7 +63,9 @@ export const staffRoutes = new Elysia({ prefix: '/api/v1/staffs' })
     .post('/ward-staffs', addWardStaffs, {
         body: t.Array(t.Object({
             // ใช้ t.Union เพื่อให้รองรับการส่งค่ามาเป็น String หรือ Number ก็ได้
-            staff_id: t.Union([t.String(), t.Number()]),
+            // staff_id = แบบเดิม · user_id = คนจาก core_kon.users (แบบใหม่)
+            staff_id: t.Optional(t.Union([t.String(), t.Number()])),
+            user_id: t.Optional(t.Union([t.String(), t.Number()])),
             ward: t.Union([t.String(), t.Number()])
         }))
     });

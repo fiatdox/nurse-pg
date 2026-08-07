@@ -1,5 +1,5 @@
 import { Context } from 'elysia';
-import { nurse } from '../db';
+import { core_kon, nurse } from '../db';
 import { sanitizeHTML } from '../utils/sanitize';
 
 
@@ -142,12 +142,24 @@ export const getWardStaffByWard = async ({ params, set }: Context) => {
     const { id } = params as Record<string, string>;
 
     try {
+        // คืน user_id มาด้วย เพราะหน้าจอเลือกคนจาก core_kon.users
+        // จึงต้องใช้ user_id เป็นคีย์ในการติ๊ก ไม่ใช่ staff_id ที่เป็นเลขภายในของเรา
         const rows = await nurse`
-            SELECT ws.staff_id, ws.ward, s.fullname, sp.position_name
+            SELECT ws.staff_id, ws.ward, s.fullname, s.user_id,
+                   sp.position_name, sp.code AS group_code
             FROM ward_staffs ws
             JOIN staffs s ON ws.staff_id = s.staff_id
             LEFT JOIN staff_position sp ON s.staff_position_id = sp.staff_position_id
             WHERE ws.ward = ${id} AND s.is_active = 'Y'
+            -- เรียงตามลำดับวิชาชีพ ไม่ใช่ตามรหัส เพราะรหัสบังเอิญเรียงถูกอยู่ตอนนี้
+            -- แต่ถ้ามีการเพิ่มกลุ่มใหม่ทีหลัง ลำดับจะเพี้ยนโดยไม่มีใครสังเกต
+            ORDER BY CASE sp.code
+                        WHEN 'RN' THEN 1
+                        WHEN 'TN' THEN 2
+                        WHEN 'PN' THEN 3
+                        ELSE 9
+                     END,
+                     s.fullname
         `;
 
         return {
@@ -197,8 +209,20 @@ export const clearWardStaffsByWard = async ({ params, set }: Context) => {
 };
 
 // ฟังก์ชันสำหรับจัดการเจ้าหน้าที่ประจำหอผู้ป่วย (Replace All ตาม ward)
+/**
+ * บันทึกเจ้าหน้าที่ประจำหอผู้ป่วย (แทนที่ทั้งชุดตาม ward)
+ *
+ * รับได้สองแบบเพื่อไม่ให้ของเดิมพัง:
+ *   user_id  — คนจาก core_kon.users (แบบใหม่ที่หน้าจอใช้)
+ *   staff_id — แถวใน staffs ที่มีอยู่แล้ว (แบบเดิม)
+ *
+ * แบบใหม่จะ upsert แถวใน staffs ให้อัตโนมัติ เพราะ ward_staffs,
+ * nurse_shift_assignments และอัตราค่าตอบแทนล้วนผูกกับ staff_id
+ * ชื่อและกลุ่มตำแหน่งอ่านจากต้นทางเสมอ ไม่รับจากหน้าจอ
+ * เพื่อให้ชื่อตรงกับทะเบียนบุคลากรจริงและกลุ่มตรงกับที่จับคู่ไว้
+ */
 export const addWardStaffs = async ({ body, set }: Context) => {
-    const payload = body as { staff_id: string | number; ward: string | number }[];
+    const payload = body as { staff_id?: string | number; user_id?: string | number; ward: string | number }[];
 
     if (!Array.isArray(payload) || payload.length === 0) {
         set.status = 400;
@@ -206,12 +230,72 @@ export const addWardStaffs = async ({ body, set }: Context) => {
     }
 
     const uniqueWards = [...new Set(payload.map(item => String(item.ward)))];
-    const values = payload.map(item => ({
-        staff_id: Number(item.staff_id),
-        ward: String(item.ward)
-    }));
+    const userIds = [...new Set(
+        payload.filter(i => i.user_id !== undefined && i.user_id !== null).map(i => Number(i.user_id))
+    )];
 
     try {
+        // แปลง user_id -> staff_id โดยสร้างแถวใน staffs ให้ถ้ายังไม่มี
+        const staffIdByUser = new Map<number, number>();
+
+        if (userIds.length > 0) {
+            const [people, mappings] = await Promise.all([
+                core_kon`
+                    SELECT u.id, CONCAT(u.pname, u.fname, ' ', u.lname) AS fullname, u.user_position_id
+                    FROM users u WHERE u.id IN ${core_kon(userIds)}
+                `,
+                nurse`SELECT user_position_id, staff_position_id FROM staff_position_mappings`,
+            ]);
+
+            const groupOf = new Map(mappings.map(m => [Number(m.user_position_id), Number(m.staff_position_id)]));
+            const missing = userIds.filter(id => !people.some(p => Number(p.id) === id));
+            if (missing.length > 0) {
+                set.status = 400;
+                return { success: false, message: `ไม่พบบุคลากรรหัส ${missing.join(', ')} ในระบบบุคลากร` };
+            }
+
+            const unmapped = people.filter(p => !groupOf.has(Number(p.user_position_id)));
+            if (unmapped.length > 0) {
+                set.status = 400;
+                return {
+                    success: false,
+                    message: `ตำแหน่งของ ${unmapped.map(p => sanitizeHTML(p.fullname)).join(', ')} ยังไม่ได้จับคู่กลุ่มในหน้าจัดการตำแหน่ง`,
+                };
+            }
+
+            await nurse.begin(async sql => {
+                for (const p of people) {
+                    const userId = Number(p.id);
+                    const fullname = sanitizeHTML(String(p.fullname ?? '').trim()) ?? '';
+                    const groupId = groupOf.get(Number(p.user_position_id))!;
+
+                    const existing = await sql`SELECT staff_id FROM staffs WHERE user_id = ${userId} LIMIT 1`;
+                    if (existing.length > 0) {
+                        // ชื่อหรือตำแหน่งอาจเปลี่ยนที่ต้นทาง ปรับตามให้ทุกครั้งที่บันทึก
+                        await sql`
+                            UPDATE staffs SET fullname = ${fullname}, staff_position_id = ${groupId}, is_active = 'Y'
+                            WHERE staff_id = ${existing[0].staff_id}
+                        `;
+                        staffIdByUser.set(userId, Number(existing[0].staff_id));
+                    } else {
+                        const inserted = await sql`
+                            INSERT INTO staffs (fullname, staff_position_id, is_active, user_id)
+                            VALUES (${fullname}, ${groupId}, 'Y', ${userId})
+                            RETURNING staff_id
+                        `;
+                        staffIdByUser.set(userId, Number(inserted[0].staff_id));
+                    }
+                }
+            });
+        }
+
+        const values = payload.map(item => ({
+            staff_id: item.user_id !== undefined && item.user_id !== null
+                ? staffIdByUser.get(Number(item.user_id))!
+                : Number(item.staff_id),
+            ward: String(item.ward),
+        }));
+
         await nurse.begin(async sql => {
             for (const ward of uniqueWards) {
                 await sql`DELETE FROM ward_staffs WHERE ward = ${ward}`;

@@ -272,6 +272,7 @@ export const getFTEByWard = async ({ body, set }: { body: { ward: string, month:
                 LEFT JOIN public.admission_shift_daily_record a
                     ON a.record_date = ds.record_date
                     AND a.shift_type_id = ss.admission_change_shift_type_id
+                    AND a.deleted_at IS NULL
                 LEFT JOIN admission_list al
                     ON al.admission_list_id = a.admission_list_id
                 WHERE al.ward = ${ward} OR al.ward IS NULL
@@ -437,6 +438,58 @@ export const getNurseScheduleByDate = async ({ body, set }: Context) => {
         };
     } catch (error) {
         console.error('Get nurse schedule by date error:', error);
+        set.status = 500;
+        return { success: false, message: 'Internal Server Error' };
+    }
+};
+
+/**
+ * สรุปจำนวนบุคลากรที่ขึ้นเวร แยกตามตำแหน่ง สำหรับหอผู้ป่วยและวันที่ที่เลือก
+ *
+ * ใช้คู่กับ FTE ในหน้ารายงานประจำวัน — FTE บอกว่า "ควรมีกี่คน" ตามภาระงาน
+ * ส่วนตัวเลขนี้บอกว่า "มีจริงกี่คน" หัวหน้าเวรจึงเห็นส่วนต่างได้ทันทีในหน้าเดียว
+ *
+ * นับหัวคนไม่ใช่นับเวร เพราะคนหนึ่งลงได้ทั้ง M และ M_OT ในวันเดียวกัน
+ * (ขึ้นเวรเช้าแล้วอยู่ OT ต่อ) ถ้านับทุกแถวจะกลายเป็นสองคนซึ่งไม่จริง
+ * ส่วน OT แยกรายงานไว้ต่างหาก เพราะเป็นสัญญาณว่ากำลังคนปกติไม่พอ
+ */
+export const getStaffOnDutyByDate = async ({ body, set }: Context) => {
+    const { ward, date } = body as { ward: string; date: string };
+
+    if (!ward?.trim() || !date?.trim()) {
+        set.status = 400;
+        return { success: false, message: 'กรุณาระบุ ward และ date' };
+    }
+
+    // แปลง DD/MM/YYYY → YYYY-MM-DD
+    const parsedDate = date.includes('/') ? date.split('/').reverse().join('-') : date;
+
+    try {
+        const rows = await nurse`
+            SELECT
+                 nst.admission_change_shift_type_id       AS shift_type_id
+                ,acst.shift_name
+                ,COALESCE(sp.code, 'OTHER')               AS position_code
+                ,COALESCE(sp.position_name, 'ไม่ระบุตำแหน่ง') AS position_name
+                ,COUNT(DISTINCT sa.staff_id)::int         AS staff_count
+                ,COUNT(DISTINCT sa.staff_id) FILTER (WHERE nst.code LIKE '%\_OT%')::int AS ot_count
+            FROM nurse_shift_assignments sa
+            JOIN nurse_shift_types nst ON nst.code = sa.shift_code
+            JOIN admission_change_shift_types acst
+              ON acst.admission_change_shift_type_id = nst.admission_change_shift_type_id
+            LEFT JOIN staffs s ON s.staff_id = sa.staff_id
+            LEFT JOIN staff_position sp ON sp.staff_position_id = s.staff_position_id
+            WHERE sa.ward = ${ward}
+              AND sa.shift_date = ${parsedDate}
+              -- OFF ผูกกับ shift type 0 ซึ่งไม่ใช่เวรจริง ต้องไม่นับเป็นคนขึ้นเวร
+              AND nst.admission_change_shift_type_id > 0
+            GROUP BY nst.admission_change_shift_type_id, acst.shift_name, sp.code, sp.position_name
+            ORDER BY nst.admission_change_shift_type_id, sp.code
+        `;
+
+        return { success: true, data: rows };
+    } catch (error) {
+        console.error('Get staff on duty by date error:', error);
         set.status = 500;
         return { success: false, message: 'Internal Server Error' };
     }

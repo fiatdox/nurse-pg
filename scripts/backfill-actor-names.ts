@@ -49,7 +49,7 @@ for (const job of JOBS) {
     );
 
     for (const row of rows) {
-        const username = String((row as { username: unknown }).username);
+        const username = String((row as unknown as { username: unknown }).username);
         const name = await nameOf(username);
 
         // ไม่มีในทะเบียนบุคลากร (เช่น 'seed' ที่สคริปต์ใส่เอง) ปล่อยว่างไว้

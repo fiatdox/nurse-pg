@@ -13,6 +13,7 @@ import { patientRoutes } from "./routes/patientRoutes";
 import { dashboardRoutes } from "./routes/dashboardRoutes";
 import { nursingRecordsRoutes } from "./routes/nursingRecordsRoutes";
 import { focusTemplateRoutes } from "./routes/focusTemplateRoutes";
+import { positionRoutes } from "./routes/positionRoutes";
 
 const app = new Elysia()
   .use(corsMiddleware)
@@ -37,6 +38,7 @@ const app = new Elysia()
           { name: "Dashboard", description: "IPD dashboard aggregation endpoints" },
           { name: "Nursing Records", description: "Nursing documentation endpoints" },
           { name: "Care Plan Templates", description: "Focus list / CNPG template management" },
+          { name: "Positions", description: "จับคู่ตำแหน่งบุคลากรเข้ากลุ่มเพื่อคิดค่าตอบแทน" },
         ],
         components: {
           securitySchemes: {
@@ -61,6 +63,7 @@ const app = new Elysia()
   .use(dashboardRoutes)
   .use(nursingRecordsRoutes)
   .use(focusTemplateRoutes)
+  .use(positionRoutes)
 
   .listen(4000);
 

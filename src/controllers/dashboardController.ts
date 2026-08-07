@@ -253,6 +253,7 @@ export const getShiftSeverityDistribution = async ({ body, set }: Context) => {
                    ON adr.record_date = ds.d
                   AND adr.shift_type_id = acst.admission_change_shift_type_id
                   AND adr.severity_level_id = sl.severity_level_id
+                  AND adr.deleted_at IS NULL
             LEFT JOIN admission_list al
                    ON al.admission_list_id = adr.admission_list_id
                   AND al.ward = ${ward}
@@ -377,10 +378,12 @@ export const getCareLevelFlow = async ({ body, set }: Context) => {
             JOIN admission_shift_daily_record a
               ON a.shift_type_id = p.from_shift
              AND a.record_date BETWEEN ${from}::date AND ${to}::date
+             AND a.deleted_at IS NULL
             JOIN admission_shift_daily_record b
               ON b.admission_list_id = a.admission_list_id
              AND b.record_date = a.record_date
              AND b.shift_type_id = p.to_shift
+             AND b.deleted_at IS NULL
             JOIN admission_list al
               ON al.admission_list_id = a.admission_list_id
              AND al.ward = ${ward}

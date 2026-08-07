@@ -10,6 +10,7 @@ import {
     registerPatient,
     updatePatient,
     upsertAdmissionShiftDailyRecord,
+    deleteAdmissionShiftDailyRecord,
     copyPreviousShiftDailyRecords,
     getPatientShiftDailyRecordsByWard,
     getPatientsBYAN,
@@ -128,6 +129,14 @@ export const patientRoutes = new Elysia({ prefix: '/api/v1/patients' })
             severity_level_id: t.Optional(t.Number()),
             hn: t.Optional(t.String()),
             an: t.Optional(t.String())
+        })
+    })
+    .delete('/admission-shift-daily-records', deleteAdmissionShiftDailyRecord, {
+        body: t.Object({
+            admission_list_id: t.Number(),
+            shift_type_id: t.Number(),
+            date: t.String(),
+            reason: nullableString
         })
     })
     .post('/patient-shift-daily-records/copy-previous', copyPreviousShiftDailyRecords, {
