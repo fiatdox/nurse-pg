@@ -9,6 +9,8 @@ export interface Actor {
     fullname: string;
     userId: string;
     positionName: string;
+    /** กลุ่มงานที่สังกัด (majors.name) — ว่างได้ถ้าบัญชียังไม่ผูกกลุ่มงาน */
+    majorName: string;
     /** บทบาททางการพยาบาลที่ได้จากตำแหน่งจริงในระบบบุคลากร ไม่ใช่ที่ผู้ใช้เลือกเอง */
     roleClass: RoleClass;
 }
@@ -50,9 +52,10 @@ export const resolveActor = async (user: unknown): Promise<Actor | null> => {
     try {
         const rows = await core_kon`
             SELECT u.id, u.username, CONCAT(u.pname, u.fname, ' ', u.lname) AS employee_name,
-                   up.position_name
+                   up.position_name, mj."name" AS major_name
             FROM users u
             LEFT JOIN user_positions up ON up.user_position_id = u.user_position_id
+            LEFT JOIN majors mj ON mj.major_id = u.major_id
             WHERE u.username = ${username}
             LIMIT 1
         `;
@@ -65,6 +68,7 @@ export const resolveActor = async (user: unknown): Promise<Actor | null> => {
             fullname: String(row.employee_name ?? '').trim() || String(row.username),
             userId: String(row.id ?? ''),
             positionName,
+            majorName: String(row.major_name ?? '').trim(),
             roleClass: roleClassOf(positionName),
         };
     } catch (error) {

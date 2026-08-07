@@ -604,34 +604,5 @@ export const getNursingTerminology = async ({ set }: Context) => {
     }
 };
 
-// ---------- แผนการพยาบาลที่ยังใช้อยู่ของผู้ป่วย (ให้ note ผูกกลับได้) ----------
-export const getActiveCarePlansByAN = async ({ params, set }: Context) => {
-    const { an } = params as { an: string };
-
-    if (!an?.trim()) {
-        set.status = 400;
-        return { success: false, message: 'กรุณาระบุ an' };
-    }
-
-    try {
-        const rows = await nurse`
-            SELECT id, nursing_diagnosis, goal, priority, status, start_date
-            FROM nursing_care_plans
-            WHERE an = ${an.trim()}
-              AND is_deleted IS NOT TRUE
-            ORDER BY start_date DESC NULLS LAST, id DESC
-        `;
-        return {
-            success: true,
-            data: rows.map(r => ({
-                ...r,
-                nursing_diagnosis: sanitizeHTML(String(r.nursing_diagnosis ?? '')),
-                goal: sanitizeHTML(String(r.goal ?? '')),
-            })),
-        };
-    } catch (error) {
-        console.error('Get care plans error:', error);
-        set.status = 500;
-        return { success: false, message: 'Internal Server Error' };
-    }
-};
+// แผนการพยาบาลของผู้ป่วย (ที่ note ผูกกลับไปหา) ย้ายไปอยู่ที่ carePlanController แล้ว
+// เพื่อให้การอ่านและการเขียนแผนใช้ตัวเดียวกัน

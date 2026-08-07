@@ -23,8 +23,25 @@ import {
     approveProgressNote,
     getPendingApprovals,
     getNursingTerminology,
-    getActiveCarePlansByAN,
 } from '../controllers/progressNoteController';
+import {
+    getCarePlansByAN,
+    getCarePlansByWard,
+    saveCarePlan,
+    updateCarePlan,
+    deleteCarePlan,
+} from '../controllers/carePlanController';
+import { suggestCarePlan, getSuggestionStatus } from '../controllers/carePlanAssistController';
+import {
+    getFocusRecordsByAN,
+    getFocusRecordsByWard,
+    saveFocusRecord,
+    updateFocusRecord,
+    completeFocusRecord,
+    deleteFocusRecord,
+    getFocusRecordRevisions,
+    getFocusIndicators,
+} from '../controllers/focusRecordController';
 
 export const nursingRecordsRoutes = new Elysia({ prefix: '/api/v1/nursing-records' })
     .use(authMiddleware)
@@ -149,7 +166,128 @@ export const nursingRecordsRoutes = new Elysia({ prefix: '/api/v1/nursing-record
     .get('/terminology', getNursingTerminology, {
         detail: { summary: 'ชุดคำมาตรฐาน NANDA-I / NIC / NOC สำหรับ dropdown' },
     })
-    .get('/care-plans/:an', getActiveCarePlansByAN, {
+    // ---------- แผนการพยาบาล (Nursing Care Plan) ----------
+    // ใช้ path ขึ้นต้นด้วยคำคงที่ ไม่ใช่ /careplan?ward_code= เพื่อให้แยกจาก /careplan/:an ชัดเจน
+    .get('/careplan-ward', getCarePlansByWard, {
+        query: t.Object({
+            ward_code: t.String(),
+            status: t.Optional(t.String()),
+            limit: t.Optional(t.String()),
+        }),
+        detail: { summary: 'แผนการพยาบาลทั้งหอผู้ป่วย พร้อมสรุปรายผู้ป่วย (ไม่ระบุ status = เอาเฉพาะที่ดำเนินการอยู่)' },
+    })
+    .get('/careplan/:an', getCarePlansByAN, {
         params: t.Object({ an: t.String() }),
+        query: t.Object({ status: t.Optional(t.String()) }),
+        detail: { summary: 'แผนการพยาบาลทั้งหมดของผู้ป่วย (กรองด้วย status ได้)' },
+    })
+    // ไม่รับ nurse_name จาก client — ผู้วางแผนมาจากบัญชีที่เข้าสู่ระบบเท่านั้น
+    .post('/careplan', saveCarePlan, {
+        body: t.Object(
+            {
+                an: t.String(),
+                ward_code: t.String(),
+            },
+            { additionalProperties: true }
+        ),
+        detail: { summary: 'เพิ่มข้อวินิจฉัยทางการพยาบาล (กันข้อวินิจฉัยเดิมเปิดค้างซ้ำ)' },
+    })
+    .put('/careplan/:id', updateCarePlan, {
+        params: t.Object({ id: t.String() }),
+        body: t.Object({}, { additionalProperties: true }),
+        detail: { summary: 'แก้ไขแผน / ปิดแผนเป็นบรรลุเป้าหมายหรือปรับแผน (ส่งเฉพาะช่องที่แก้ได้)' },
+    })
+    // ร่างเท่านั้น ไม่บันทึกอะไร พยาบาลต้องกดบันทึกเองผ่าน POST /careplan
+    .post('/careplan-suggest', suggestCarePlan, {
+        body: t.Object(
+            {
+                an: t.String(),
+                nursing_diagnosis: t.String(),
+                related_to: t.Optional(t.String()),
+                goal: t.Optional(t.String()),
+            },
+            { additionalProperties: true }
+        ),
+        detail: { summary: 'สั่งให้โมเดลในเครือข่ายโรงพยาบาลร่างกิจกรรมการพยาบาล (ตอบ job_id ทันที ไม่ค้างสาย)' },
+    })
+    // โมเดลใช้เวลานานกว่าที่ proxy ระหว่างทางยอมให้ค้างสาย จึงต้องถามผลเป็นระยะแทนการรอ
+    .get('/careplan-suggest/:jobId', getSuggestionStatus, {
+        params: t.Object({ jobId: t.String() }),
+        detail: { summary: 'ถามผลของคำขอร่าง (pending / done / error)' },
+    })
+    .delete('/careplan/:id', deleteCarePlan, {
+        params: t.Object({ id: t.String() }),
+        detail: { summary: 'ลบแผนการพยาบาล (soft delete · แผนที่มีบันทึกอ้างถึงแล้วลบไม่ได้)' },
+    })
+    // ---------- แผนการพยาบาลแบบ Focus list ----------
+    // ใช้ path ขึ้นต้นด้วยคำคงที่เหมือนกลุ่มอื่น เพราะ router ของ Elysia
+    // ไม่ยอมให้ตำแหน่งเดียวกันมีชื่อพารามิเตอร์ต่างกัน
+    .get('/focus-ward', getFocusRecordsByWard, {
+        query: t.Object({
+            ward_code: t.String(),
+            status: t.Optional(t.String()),
+            template_code: t.Optional(t.String()),
+            from: t.Optional(t.String()),
+            to: t.Optional(t.String()),
+            limit: t.Optional(t.String()),
+        }),
+        detail: { summary: 'ใบ Focus ทั้งหอผู้ป่วย (ดูว่าใบไหนยังค้างเป็นร่าง)' },
+    })
+    // เหตุผลหลักที่ผลประเมินเป็นช่องติ๊ก — สรุปเป็นตัวชี้วัดได้โดยไม่ต้องเปิดอ่านทีละใบ
+    .get('/focus-indicators', getFocusIndicators, {
+        query: t.Object({
+            template_code: t.String(),
+            ward_code: t.Optional(t.String()),
+            from: t.Optional(t.String()),
+            to: t.Optional(t.String()),
+        }),
+        detail: { summary: 'สรุปผลการประเมินเป็นตัวชี้วัด (นับเฉพาะใบที่ปิดแล้ว)' },
+    })
+    .get('/focus-revisions/:id', getFocusRecordRevisions, {
+        params: t.Object({ id: t.String() }),
+        detail: { summary: 'ประวัติการแก้ไขของใบ Focus หนึ่งใบ' },
+    })
+    .get('/focus/:an', getFocusRecordsByAN, {
+        params: t.Object({ an: t.String() }),
+        query: t.Object({ status: t.Optional(t.String()) }),
+        detail: { summary: 'ใบ Focus ทั้งหมดของผู้ป่วย (กรองด้วย status ได้)' },
+    })
+    // ไม่รับ nurse_name จาก client — ผู้บันทึกมาจากบัญชีที่เข้าสู่ระบบเท่านั้น
+    .post('/focus', saveFocusRecord, {
+        body: t.Object(
+            {
+                an: t.String(),
+                // รับเป็นข้อความได้ด้วย เพราะ id เป็น bigint ซึ่ง postgres.js คืนมาเป็น string
+                // หน้าจอที่ส่งค่าที่เพิ่งอ่านมาจาก API กลับมาตรงๆ จึงส่งเป็นข้อความ
+                // controller แปลงเป็นตัวเลขและตรวจว่าเป็นจำนวนเต็มบวกอยู่แล้ว
+                template_id: t.Union([t.Number(), t.String()]),
+            },
+            { additionalProperties: true }
+        ),
+        detail: { summary: 'เปิดใบ Focus จากแม่แบบ (คัดลอกโครงแม่แบบติดไปกับใบ)' },
+    })
+    // แก้ร่างไม่ต้องมีเหตุผล แต่แก้ใบที่ปิดแล้วต้องมีเสมอ — controller เป็นคนตัดสิน
+    .put('/focus/:id', updateFocusRecord, {
+        params: t.Object({ id: t.String() }),
+        body: t.Object(
+            { amend_reason: t.Optional(t.String()) },
+            { additionalProperties: true }
+        ),
+        detail: { summary: 'บันทึกผลการประเมิน (ใบที่ปิดแล้วต้องระบุเหตุผลและเก็บฉบับเดิม)' },
+    })
+    .post('/focus-complete/:id', completeFocusRecord, {
+        params: t.Object({ id: t.String() }),
+        detail: { summary: 'ปิดใบให้เข้าเวชระเบียน (ทุกระยะต้องมีผลประเมินอย่างน้อยหนึ่งรายการ)' },
+    })
+    .delete('/focus/:id', deleteFocusRecord, {
+        params: t.Object({ id: t.String() }),
+        query: t.Object({ reason: t.Optional(t.String()) }),
+        detail: { summary: 'ยกเลิกใบ Focus (ใบที่ปิดแล้วต้องระบุเหตุผล เก็บแถวไว้เสมอ)' },
+    })
+
+    // ชื่อเดิมที่หน้าบันทึกทางการพยาบาลใช้ผูก note กลับไปที่ข้อวินิจฉัย
+    .get('/care-plans/:an', getCarePlansByAN, {
+        params: t.Object({ an: t.String() }),
+        query: t.Object({ status: t.Optional(t.String()) }),
         detail: { summary: 'แผนการพยาบาลของผู้ป่วย ใช้ผูกบันทึกกลับไปที่ข้อวินิจฉัย' },
     });
