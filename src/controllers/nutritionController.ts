@@ -1,6 +1,8 @@
 import { Context } from 'elysia';
 import { nurse } from '../db';
 import { sanitizeHTML } from '../utils/sanitize';
+import { resolveActor, type Actor } from '../utils/nursingRecord';
+import { isAdmin } from './systemSettingsController';
 
 // ฟังก์ชันสำหรับดึงข้อมูลรายการอาหาร
 export const getNutritionMenu = async ({ set }: Context) => {
@@ -66,7 +68,9 @@ export const orderMenu = async ({ body, set }: { body: any[], set: any }) => {
         await nurse.begin(async sql => {
             await sql`
                 INSERT INTO food_orders ${sql(values, 'admission_list_id', 'an', 'ward', 'order_date', 'meal', 'food_item_id', 'request_by', 'addon', 'create_datetime')}
-                ON CONFLICT (order_date, meal, an) DO UPDATE SET
+                -- ต้องมี WHERE ให้ตรงกับ uq_food_orders_active ที่เป็นดัชนีบางส่วน
+                -- รายการที่ถูกยกเลิกไปแล้วจึงไม่ถูกนับเป็นรายการซ้ำ สั่งใหม่ได้เป็นแถวใหม่
+                ON CONFLICT (order_date, meal, an) WHERE cancelled_at IS NULL DO UPDATE SET
                     food_item_id = EXCLUDED.food_item_id,
                     addon = EXCLUDED.addon,
                     request_by = EXCLUDED.request_by,
@@ -95,6 +99,27 @@ export const getFoodOrdersByWard = async ({ body, set }: { body: { ward: string,
     }
 
     try {
+        /*
+          LATERAL แทนคิวรีย่อยชุดเดิม เพราะต้องได้ food_order_id ของแต่ละมื้อมาด้วย
+          หน้าจอถึงจะสั่งยกเลิกรายมื้อได้ ถ้าใช้คิวรีย่อยจะต้องเขียนซ้ำอีกสามชุด
+
+          LEFT JOIN กับ food_items ไม่ใช่ JOIN เพื่อให้รายการที่ผูกกับเมนูที่ถูกปิดไปแล้ว
+          ยังโผล่มาให้ยกเลิกได้ ไม่ใช่หายไปเงียบๆ ทั้งที่ครัวยังเห็นอยู่
+        */
+        const mealPick = (mealNo: number) => nurse`
+            LEFT JOIN LATERAL (
+                SELECT fo.food_order_id, fi.food_name, NULLIF(TRIM(fo.addon), '') AS addon,
+                       -- COALESCE เพราะคอลัมน์เป็น NULL ตอนยังไม่รับ แล้ว NULL = 'Y' ได้ NULL ไม่ใช่ false
+                       COALESCE(fo.recieve_order_status = 'Y', false) AS received, fo.reciever_name
+                FROM food_orders fo
+                LEFT JOIN food_items fi ON fi.food_item_id = fo.food_item_id
+                WHERE fo.an = al.an
+                  AND fo.order_date = ${date}
+                  AND fo.meal = ${mealNo}
+                  AND fo.cancelled_at IS NULL
+                LIMIT 1
+            )`;
+
         const rows = await nurse`
             SELECT
                 al.admission_list_id,
@@ -102,40 +127,23 @@ export const getFoodOrdersByWard = async ({ body, set }: { body: { ward: string,
                 al.an,
                 al.patient_name,
                 al.bedno,
-                (
-                    SELECT fi.food_name
-                    FROM food_orders fo
-                    JOIN food_items fi ON fo.food_item_id = fi.food_item_id
-                    WHERE fo.an = al.an AND fo.order_date = ${date} AND fo.meal = 1
-                ) AS breakfast,
-                (
-                    SELECT NULLIF(TRIM(fo.addon), '')
-                    FROM food_orders fo
-                    WHERE fo.an = al.an AND fo.order_date = ${date} AND fo.meal = 1
-                ) AS breakfast_addon,
-                (
-                    SELECT fi.food_name
-                    FROM food_orders fo
-                    JOIN food_items fi ON fo.food_item_id = fi.food_item_id
-                    WHERE fo.an = al.an AND fo.order_date = ${date} AND fo.meal = 2
-                ) AS lunch,
-                (
-                    SELECT NULLIF(TRIM(fo.addon), '')
-                    FROM food_orders fo
-                    WHERE fo.an = al.an AND fo.order_date = ${date} AND fo.meal = 2
-                ) AS lunch_addon,
-                (
-                    SELECT fi.food_name
-                    FROM food_orders fo
-                    JOIN food_items fi ON fo.food_item_id = fi.food_item_id
-                    WHERE fo.an = al.an AND fo.order_date = ${date} AND fo.meal = 3
-                ) AS dinner,
-                (
-                    SELECT NULLIF(TRIM(fo.addon), '')
-                    FROM food_orders fo
-                    WHERE fo.an = al.an AND fo.order_date = ${date} AND fo.meal = 3
-                ) AS dinner_addon
+                b.food_order_id AS breakfast_order_id,
+                b.food_name     AS breakfast,
+                b.addon         AS breakfast_addon,
+                b.received      AS breakfast_received,
+                l.food_order_id AS lunch_order_id,
+                l.food_name     AS lunch,
+                l.addon         AS lunch_addon,
+                l.received      AS lunch_received,
+                d.food_order_id AS dinner_order_id,
+                d.food_name     AS dinner,
+                d.addon         AS dinner_addon,
+                d.received      AS dinner_received,
+                COALESCE(b.reciever_name, l.reciever_name, d.reciever_name) AS reciever_name
             FROM admission_list al
+            ${mealPick(1)} b ON TRUE
+            ${mealPick(2)} l ON TRUE
+            ${mealPick(3)} d ON TRUE
             WHERE al.discharge_type_id = 0 AND al.ward = ${ward}
             ORDER BY al.bedno ASC
         `;
@@ -182,6 +190,7 @@ export const getFoodOrdersAddonByWard = async ({ body, set }: { body: { ward: st
             JOIN food_items fi ON fo.food_item_id = fi.food_item_id
             JOIN meal m ON fo.meal = m.meal
             WHERE fo.ward = ${ward} AND fo.order_date = ${date} AND fo.meal = ${meal}
+              AND fo.cancelled_at IS NULL
             ORDER BY al.bedno ASC
         `;
 
@@ -233,22 +242,110 @@ export const updateFoodOrderAddon = async ({ body, set }: { body: { ward: string
     }
 };
 
-// ฟังก์ชันสำหรับยกเลิกรายการอาหาร
-export const cancelOrderMenu = async ({ body, set }: { body: any[], set: any }) => {
+/**
+ * ตรวจว่าเป็นเจ้าหน้าที่งานโภชนาการหรือไม่
+ *
+ * ผูกกับกลุ่มงานจริงในทะเบียนบุคลากร ไม่ได้สร้างบทบาทใหม่ในฐานข้อมูล hris
+ * ที่ใช้ร่วมกับระบบอื่น และไม่ให้หน้าจอเป็นคนบอกว่าตัวเองเป็นใคร
+ * ผู้ดูแลระบบผ่านได้ด้วย เพราะต้องแก้ปัญหาให้หน่วยงานได้ตอนมีเรื่องด่วน
+ */
+const NUTRITION_MAJOR = 'กลุ่มงานโภชนศาสตร์';
+
+export const isNutritionStaff = async (user: unknown): Promise<{ ok: boolean; actor: Actor | null }> => {
+    const actor = await resolveActor(user);
+    if (!actor) return { ok: false, actor: null };
+    if (actor.majorName === NUTRITION_MAJOR) return { ok: true, actor };
+    return { ok: await isAdmin(user), actor };
+};
+
+// หน้าจอใช้ค่านี้ตัดสินว่าจะโชว์เมนูงานโภชนาการไหม การกันจริงอยู่ที่ทุก endpoint ที่เขียนข้อมูล
+export const getNutritionAccess = async ({ user }: { user?: unknown }) => {
+    const { ok, actor } = await isNutritionStaff(user);
+    return {
+        success: true,
+        data: {
+            can_receive: ok,
+            major_name: actor?.majorName ?? '',
+            fullname: actor?.fullname ?? '',
+        },
+    };
+};
+
+/**
+ * ยกเลิกรายการอาหาร — ทำเครื่องหมายไว้ ไม่ลบแถวทิ้ง
+ *
+ * ใบสรุปรายการอาหารถูกพิมพ์ส่งครัวไปแล้ว ถ้าลบจริงจะไล่ไม่ได้ว่าทำไมยอดที่ครัว
+ * ได้รับไม่ตรงกับยอดในระบบ จึงเก็บแถวไว้พร้อมชื่อคนยกเลิกกับเหตุผล
+ * แล้วให้ทุกคิวรีที่ส่งรายการให้ครัวข้ามแถวที่ถูกยกเลิก
+ */
+export const cancelOrderMenu = async ({ body, set, user }: { body: any[], set: any, user?: unknown }) => {
     const orders = body;
 
     if (!orders || orders.length === 0) {
         set.status = 400;
-        return { success: false, message: 'ไม่พบรายการที่ต้องการลบ' };
+        return { success: false, message: 'ไม่พบรายการที่ต้องการยกเลิก' };
     }
 
+    const ids = orders
+        .map(o => Number(o.food_order_id))
+        .filter(id => Number.isInteger(id) && id > 0);
+
+    if (ids.length === 0) {
+        set.status = 400;
+        return { success: false, message: 'รหัสรายการอาหารไม่ถูกต้อง' };
+    }
+
+    // เหตุผลรับมาได้จากรายการแรก หน้าจอยกเลิกทีละมื้ออยู่แล้ว
+    const reason = String(sanitizeHTML(String(orders[0]?.reason ?? '').trim()) ?? '').slice(0, 500) || null;
+
     try {
-        const ids = orders.map(o => o.food_order_id);
-        const result = await nurse`DELETE FROM food_orders WHERE food_order_id IN ${nurse(ids)}`;
+        const { ok: nutritionStaff, actor } = await isNutritionStaff(user);
+        const actorId = actor?.userId ? Number(actor.userId) : null;
+
+        /*
+          รายการที่งานโภชนาการรับไปแล้ว หอผู้ป่วยยกเลิกเองไม่ได้
+          ของอาจเข้าครัวไปแล้ว ถ้าหายไปเงียบๆ ยอดที่เตรียมกับยอดที่สั่งจะไม่ตรงกัน
+          ถ้าต้องยกเลิกจริงต้องแจ้งงานโภชนาการให้ถอนการรับก่อน คนของหน่วยนั้นยกเลิกได้เอง
+        */
+        if (!nutritionStaff) {
+            const locked = await nurse`
+                SELECT food_order_id, reciever_name,
+                       TO_CHAR(recieve_order_datetime, 'DD/MM/YYYY HH24:MI') AS at
+                FROM food_orders
+                WHERE food_order_id IN ${nurse(ids)}
+                  AND cancelled_at IS NULL
+                  AND recieve_order_status = 'Y'
+            `;
+            if (locked.length > 0) {
+                set.status = 409;
+                const who = sanitizeHTML(locked[0].reciever_name) || 'งานโภชนาการ';
+                return {
+                    success: false,
+                    message: `ยกเลิกไม่ได้ เพราะ${who}รับรายการไปแล้วเมื่อ ${locked[0].at} น. กรุณาแจ้งงานโภชนาการให้ถอนการรับก่อน`,
+                };
+            }
+        }
+
+        const result = await nurse`
+            UPDATE food_orders
+            SET cancelled_at      = NOW(),
+                cancelled_by      = ${actorId},
+                cancelled_by_name = ${actor?.fullname ?? null},
+                cancel_reason     = ${reason}
+            WHERE food_order_id IN ${nurse(ids)}
+              AND cancelled_at IS NULL
+            RETURNING food_order_id
+        `;
+
+        if (result.length === 0) {
+            set.status = 404;
+            return { success: false, message: 'ไม่พบรายการที่ยังใช้งานอยู่ อาจถูกยกเลิกไปแล้ว' };
+        }
 
         return {
             success: true,
-            message: `ลบรายการอาหารเรียบร้อยแล้ว จำนวน ${result.count} รายการ`
+            message: `ยกเลิกรายการอาหารเรียบร้อยแล้ว จำนวน ${result.length} รายการ`,
+            data: { cancelled: result.map(r => r.food_order_id) }
         };
     } catch (error) {
         console.error('Cancel order menu error:', error);
@@ -280,17 +377,22 @@ export const getFoodOrderHistoryByAN = async ({ body, set }: { body: { an: strin
                 ,fo.addon
                 ,fo.ward
                 ,fo.create_datetime
+                ,TO_CHAR(fo.cancelled_at, 'YYYY-MM-DD HH24:MI') AS cancelled_at
+                ,fo.cancelled_by_name
+                ,fo.cancel_reason
             FROM food_orders fo
             JOIN meal m ON m.meal = fo.meal
             LEFT JOIN food_items fi ON fi.food_item_id = fo.food_item_id
             WHERE fo.an = ${an.trim()}
               AND fo.order_date > CURRENT_DATE - ${lookback}::int
               AND fo.order_date <= CURRENT_DATE
-            ORDER BY fo.order_date DESC, fo.meal ASC
+            ORDER BY fo.order_date DESC, fo.meal ASC, fo.food_order_id ASC
         `;
 
         return {
             success: true,
+            // รายการที่ยกเลิกแล้วยังส่งกลับไปด้วย ประวัติจึงบอกได้ว่าเคยสั่งอะไรไว้
+            // แล้วใครเป็นคนเอาออกเมื่อไหร่ ซึ่งเป็นเหตุผลที่ไม่ลบแถวทิ้งตั้งแต่แรก
             data: rows.map(row => ({
                 foodOrderId: row.food_order_id,
                 orderDate: row.order_date,
@@ -299,10 +401,166 @@ export const getFoodOrderHistoryByAN = async ({ body, set }: { body: { an: strin
                 foodName: sanitizeHTML(row.food_name),
                 addon: sanitizeHTML(row.addon),
                 ward: row.ward,
+                cancelledAt: row.cancelled_at,
+                cancelledBy: sanitizeHTML(row.cancelled_by_name),
+                cancelReason: sanitizeHTML(row.cancel_reason),
             }))
         };
     } catch (error) {
         console.error('Get food order history error:', error);
+        set.status = 500;
+        return { success: false, message: 'Internal Server Error' };
+    }
+};
+
+/**
+ * สรุปรายการอาหารประจำวันสำหรับงานโภชนาการ
+ *
+ * ครัวต้องการสองมุมพร้อมกัน: ยอดรวมทั้งโรงพยาบาลว่าต้องทำเมนูไหนกี่ที่
+ * กับยอดแยกรายหอว่าจัดใส่รถเข็นของแต่ละตึกอย่างละกี่ที่
+ * ส่งเป็นแถวย่อยรายหอ×เมนู แล้วให้หน้าจอรวมยอดเอง จะได้ไม่ต้องยิงสองรอบ
+ */
+export const getDailyFoodSummary = async ({ body, set }: { body: { date: string }, set: any }) => {
+    const date = String(body?.date ?? '').trim();
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+        set.status = 400;
+        return { success: false, message: 'กรุณาระบุวันที่ในรูปแบบ YYYY-MM-DD' };
+    }
+
+    try {
+        const rows = await nurse`
+            SELECT
+                 fo.meal
+                ,fo.ward
+                ,COALESCE(w.ward_name, 'ไม่ระบุหอผู้ป่วย') AS ward_name
+                ,fo.food_item_id
+                ,COALESCE(fi.food_name, 'ไม่พบเมนูในระบบ')  AS food_name
+                ,COUNT(*)::int                              AS qty
+                ,COUNT(*) FILTER (WHERE fo.recieve_order_status = 'Y')::int AS received
+                ,COUNT(*) FILTER (WHERE fo.addon IS NOT NULL AND TRIM(fo.addon) <> '')::int AS with_addon
+            FROM food_orders fo
+            LEFT JOIN ward w       ON w.his_code = fo.ward
+            LEFT JOIN food_items fi ON fi.food_item_id = fo.food_item_id
+            WHERE fo.order_date = ${date}
+              AND fo.cancelled_at IS NULL
+            GROUP BY fo.meal, fo.ward, w.ward_name, fo.food_item_id, fi.food_name
+            ORDER BY fo.meal, w.ward_name NULLS LAST, food_name
+        `;
+
+        // หมายเหตุรายคน ครัวต้องเห็นเป็นรายบรรทัด รวมยอดแทนกันไม่ได้
+        const addons = await nurse`
+            SELECT fo.meal, fo.ward, fo.an, al.bedno, al.patient_name,
+                   COALESCE(fi.food_name, '-') AS food_name, fo.addon
+            FROM food_orders fo
+            LEFT JOIN admission_list al ON al.an = fo.an
+            LEFT JOIN food_items fi     ON fi.food_item_id = fo.food_item_id
+            WHERE fo.order_date = ${date}
+              AND fo.cancelled_at IS NULL
+              AND fo.addon IS NOT NULL AND TRIM(fo.addon) <> ''
+            ORDER BY fo.meal, fo.ward, al.bedno
+        `;
+
+        // สถานะการรับรายหอ×มื้อ — ใช้เวลาที่รับล่าสุดเป็นตัวแทนของทั้งชุด
+        const status = await nurse`
+            SELECT
+                 fo.meal
+                ,fo.ward
+                ,COALESCE(w.ward_name, 'ไม่ระบุหอผู้ป่วย') AS ward_name
+                ,COUNT(*)::int AS total
+                ,COUNT(*) FILTER (WHERE fo.recieve_order_status = 'Y')::int AS received
+                ,MAX(fo.reciever_name) FILTER (WHERE fo.recieve_order_status = 'Y') AS reciever_name
+                ,TO_CHAR(MAX(fo.recieve_order_datetime), 'DD/MM/YYYY HH24:MI') AS received_at
+            FROM food_orders fo
+            LEFT JOIN ward w ON w.his_code = fo.ward
+            WHERE fo.order_date = ${date}
+              AND fo.cancelled_at IS NULL
+            GROUP BY fo.meal, fo.ward, w.ward_name
+            ORDER BY fo.meal, w.ward_name NULLS LAST
+        `;
+
+        return {
+            success: true,
+            data: {
+                date,
+                rows: rows.map(r => ({ ...r, food_name: sanitizeHTML(r.food_name), ward_name: sanitizeHTML(r.ward_name) })),
+                addons: addons.map(r => ({
+                    ...r,
+                    patient_name: sanitizeHTML(r.patient_name),
+                    food_name: sanitizeHTML(r.food_name),
+                    addon: sanitizeHTML(r.addon),
+                })),
+                wards: status.map(r => ({
+                    ...r,
+                    ward_name: sanitizeHTML(r.ward_name),
+                    reciever_name: sanitizeHTML(r.reciever_name),
+                    pending: r.total - r.received,
+                })),
+            },
+        };
+    } catch (error) {
+        console.error('Get daily food summary error:', error);
+        set.status = 500;
+        return { success: false, message: 'Internal Server Error' };
+    }
+};
+
+/**
+ * งานโภชนาการรับรายการอาหารของหอผู้ป่วยหนึ่งมื้อหนึ่ง
+ *
+ * รับทั้งชุดไม่ใช่ทีละราย เพราะครัวทำงานเป็นรอบต่อมื้อต่อตึก ไม่ได้ไล่ทีละเตียง
+ * เมื่อรับแล้วหอผู้ป่วยจะยกเลิกเองไม่ได้ ถอนได้เฉพาะคนของงานโภชนาการ
+ */
+export const receiveFoodOrders = async (
+    { body, set, user }: { body: { ward: string, date: string, meal: number, undo?: boolean }, set: any, user?: unknown }
+) => {
+    const { ward, date, meal, undo } = body ?? {};
+
+    if (!ward || !/^\d{4}-\d{2}-\d{2}$/.test(String(date ?? '')) || ![1, 2, 3].includes(Number(meal))) {
+        set.status = 400;
+        return { success: false, message: 'กรุณาระบุ ward, date (YYYY-MM-DD) และ meal (1-3) ให้ถูกต้อง' };
+    }
+
+    const { ok, actor } = await isNutritionStaff(user);
+    if (!ok) {
+        set.status = 403;
+        return { success: false, message: 'เฉพาะเจ้าหน้าที่งานโภชนาการเท่านั้นที่รับรายการอาหารได้' };
+    }
+
+    try {
+        const actorId = actor?.userId ? Number(actor.userId) : null;
+
+        const result = undo
+            ? await nurse`
+                UPDATE food_orders
+                SET recieve_order_status = NULL, recieve_order_datetime = NULL,
+                    reciever = NULL, reciever_name = NULL
+                WHERE ward = ${ward} AND order_date = ${date} AND meal = ${Number(meal)}
+                  AND cancelled_at IS NULL AND recieve_order_status = 'Y'
+                RETURNING food_order_id`
+            : await nurse`
+                UPDATE food_orders
+                SET recieve_order_status = 'Y', recieve_order_datetime = NOW(),
+                    reciever = ${actorId}, reciever_name = ${actor?.fullname ?? null}
+                WHERE ward = ${ward} AND order_date = ${date} AND meal = ${Number(meal)}
+                  AND cancelled_at IS NULL AND recieve_order_status IS DISTINCT FROM 'Y'
+                RETURNING food_order_id`;
+
+        if (result.length === 0) {
+            set.status = 404;
+            return {
+                success: false,
+                message: undo ? 'ไม่พบรายการที่รับไว้ของหอผู้ป่วยและมื้อนี้' : 'ไม่พบรายการที่ยังไม่ได้รับของหอผู้ป่วยและมื้อนี้',
+            };
+        }
+
+        return {
+            success: true,
+            message: `${undo ? 'ถอนการรับ' : 'รับ'}รายการอาหารเรียบร้อยแล้ว จำนวน ${result.length} รายการ`,
+            data: { affected: result.length },
+        };
+    } catch (error) {
+        console.error('Receive food orders error:', error);
         set.status = 500;
         return { success: false, message: 'Internal Server Error' };
     }

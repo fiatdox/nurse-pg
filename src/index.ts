@@ -14,6 +14,9 @@ import { dashboardRoutes } from "./routes/dashboardRoutes";
 import { nursingRecordsRoutes } from "./routes/nursingRecordsRoutes";
 import { focusTemplateRoutes } from "./routes/focusTemplateRoutes";
 import { positionRoutes } from "./routes/positionRoutes";
+import { rateRoutes } from "./routes/rateRoutes";
+import { wardQuotaRoutes } from "./routes/wardQuotaRoutes";
+import { holidayRoutes } from "./routes/holidayRoutes";
 
 const app = new Elysia()
   .use(corsMiddleware)
@@ -39,6 +42,9 @@ const app = new Elysia()
           { name: "Nursing Records", description: "Nursing documentation endpoints" },
           { name: "Care Plan Templates", description: "Focus list / CNPG template management" },
           { name: "Positions", description: "จับคู่ตำแหน่งบุคลากรเข้ากลุ่มเพื่อคิดค่าตอบแทน" },
+          { name: "Rates", description: "อัตราค่าตอบแทนต่อเวร แยกตามกลุ่มตำแหน่ง" },
+          { name: "Ward Quotas", description: "อัตรากำลังต่อเวร แยกตามหอผู้ป่วยและกลุ่มตำแหน่ง" },
+          { name: "Holidays", description: "วันหยุดขององค์กร (ไม่รวมเสาร์–อาทิตย์)" },
         ],
         components: {
           securitySchemes: {
@@ -64,6 +70,9 @@ const app = new Elysia()
   .use(nursingRecordsRoutes)
   .use(focusTemplateRoutes)
   .use(positionRoutes)
+  .use(rateRoutes)
+  .use(wardQuotaRoutes)
+  .use(holidayRoutes)
 
   .listen(4000);
 

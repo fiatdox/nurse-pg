@@ -40,6 +40,22 @@ const ADMIT_FIELDS = [
     'informed_consent', 'patient_identified',
     'discharge_plan_topics', 'discharge_plan_note', 'expected_los',
     'reviewed_by', 'reviewed_at',
+    // marital_status, religion, occupation, education_level, payment_scheme, communication
+    // มีคอลัมน์อยู่ในตารางแต่ไม่รับค่าจากหน้าจอ — ทะเบียนผู้ป่วยใน HIS เป็นต้นทางของข้อมูลชุดนี้
+    // ใบบันทึกการรวบรวมข้อมูลแรกรับ (SD-IM-003.019) — ส่วนหัว
+    'readmit_28_days', 'refer_from', 'initial_symptoms',
+    // ประวัติการเจ็บป่วยในอดีต
+    'allergy_status', 'surgery_status', 'surgery_detail',
+    'substance_status', 'substance_detail',
+    'chronic_status', 'chronic_diseases', 'chronic_other',
+    'treatment_status', 'treatment_detail',
+    // ข้อมูลทั่วไป / สถานภาพทางสังคม
+    'social_role', 'dependents_count', 'social_other',
+    'family_housing', 'caregiver_status',
+    'disability_status', 'disability_detail',
+    'environment_status', 'environment_detail',
+    'economic_status', 'economic_detail',
+    'spiritual_belief', 'contact_address', 'contact_phone',
 ] as const;
 
 /** ฟิลด์ข้อความอิสระที่ผู้ใช้พิมพ์เอง ต้องล้างแท็กก่อนส่งออก */
@@ -63,6 +79,16 @@ const ADMIT_TEXT_FIELDS = [
     'emotional_state', 'emotional_note', 'adl_level', 'isolation_precaution',
     'informed_consent', 'patient_identified',
     'discharge_plan_topics', 'discharge_plan_note', 'reviewed_by',
+    'readmit_28_days', 'refer_from', 'initial_symptoms',
+    'allergy_status', 'surgery_status', 'surgery_detail',
+    'substance_status', 'substance_detail',
+    'chronic_status', 'chronic_diseases', 'chronic_other',
+    'treatment_status', 'treatment_detail',
+    'social_role', 'social_other', 'family_housing', 'caregiver_status',
+    'disability_status', 'disability_detail',
+    'environment_status', 'environment_detail',
+    'economic_status', 'economic_detail',
+    'spiritual_belief', 'contact_address', 'contact_phone',
 ];
 
 /**

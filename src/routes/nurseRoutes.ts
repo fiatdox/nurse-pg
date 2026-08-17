@@ -10,6 +10,7 @@ import {
     getNurseScheduleByDate,
     getStaffOnDutyByDate
 } from '../controllers/nurseController';
+import { generateSchedule } from '../controllers/autoScheduleController';
 
 export const nurseRoutes = new Elysia({ prefix: '/api/v1/nurse' })
     .use(authMiddleware)
@@ -51,6 +52,17 @@ export const nurseRoutes = new Elysia({ prefix: '/api/v1/nurse' })
             t.Number(),
             t.Object({ shift_assignment_id: t.Number() })
         ]))
+    })
+    /**
+     * จัดเวรอัตโนมัติ — คืน "ร่าง" ไม่เขียนฐานข้อมูล
+     * หน้าจอต้องให้คนตรวจแล้วบันทึกผ่าน /nurse-schedules เอง
+     */
+    .post('/auto-schedule', generateSchedule, {
+        body: t.Object({
+            ward: t.String(),
+            month: t.String()
+        }),
+        detail: { summary: 'สร้างร่างตารางเวรจากอัตรากำลังที่ตั้งไว้ (ไม่บันทึก)' }
     })
     .post('/staff-on-duty', getStaffOnDutyByDate, {
         body: t.Object({

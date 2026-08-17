@@ -8,7 +8,10 @@ import {
     getFoodOrdersAddonByWard,
     updateFoodOrderAddon,
     cancelOrderMenu,
-    getFoodOrderHistoryByAN
+    getFoodOrderHistoryByAN,
+    getNutritionAccess,
+    getDailyFoodSummary,
+    receiveFoodOrders
 } from '../controllers/nutritionController';
 
 export const nutritionRoutes = new Elysia({ prefix: '/api/v1/nutrition' })
@@ -61,6 +64,24 @@ export const nutritionRoutes = new Elysia({ prefix: '/api/v1/nutrition' })
     })
     .post('/cancel-order-menu', cancelOrderMenu, {
         body: t.Array(t.Object({
-            food_order_id: t.Number()
-        }))
+            food_order_id: t.Number(),
+            reason: t.Optional(t.Union([t.String(), t.Null()]))
+        })),
+        detail: { summary: 'ยกเลิกรายการสั่งอาหาร (ทำเครื่องหมาย ไม่ลบแถว เก็บชื่อผู้ยกเลิกและเหตุผลไว้)' }
+    })
+    .get('/access', getNutritionAccess, {
+        detail: { summary: 'สิทธิ์งานโภชนาการของผู้ใช้ที่ล็อกอินอยู่ ใช้ตัดสินว่าจะแสดงเมนูไหม' }
+    })
+    .post('/daily-summary', getDailyFoodSummary, {
+        body: t.Object({ date: t.String() }),
+        detail: { summary: 'สรุปรายการอาหารประจำวัน แยกตามมื้อ หอผู้ป่วย และเมนู' }
+    })
+    .post('/receive-orders', receiveFoodOrders, {
+        body: t.Object({
+            ward: t.String(),
+            date: t.String(),
+            meal: t.Number(),
+            undo: t.Optional(t.Boolean())
+        }),
+        detail: { summary: 'งานโภชนาการรับรายการอาหารรายหอผู้ป่วยต่อมื้อ (undo = ถอนการรับ)' }
     })
