@@ -174,48 +174,57 @@ export const operationFollowup = async ({ body, set }: Context) => {
     const { date1, date2 } = body as { date1: string; date2: string };
 
     try {
+        /*
+          ของเดิมรวมยอด operation_list ทั้งตาราง (201,568 แถว / 97,792 HN) สองรอบ
+          รอบละหนึ่งแผนก โดยไม่สนช่วงวันที่ที่ผู้ใช้เลือกเลย เวลาจึงคงที่ 3.3 วินาที
+          ไม่ว่าจะขอครึ่งเดือนหรือทั้งปี
+
+          เปลี่ยนเป็นหาใบตรวจที่เข้าเงื่อนไขก่อน แล้วค่อยรวมยอดการผ่าตัด
+          เฉพาะ HN ที่โผล่ในชุดนั้น (ราว 400 คน) เหลือสแกนรอบเดียว
+        */
         const sql = `
-            WITH OPD_Ops AS (
-                SELECT
-                    hn,
-                    MIN(operation_date) AS opd_operation_date,
-                    SUBSTRING_INDEX(GROUP_CONCAT(operation_name ORDER BY operation_date ASC), ',', 1) AS opd_operation_name
-                FROM operation_list
-                WHERE patient_department = 'OPD'
-                GROUP BY hn
+            WITH visits AS (
+                SELECT a.vn, a.icd10, a.diagtype, b.hn, b.vstdate
+                FROM ovstdiag a
+                JOIN ovst b ON b.vn = a.vn
+                WHERE a.icd10 IN ('t814', 'a499')
+                  AND b.vstdate BETWEEN ? AND ?
             ),
-            IPD_Ops AS (
+            ops AS (
                 SELECT
-                    hn,
-                    MIN(operation_date) AS ipd_operation_date,
-                    SUBSTRING_INDEX(GROUP_CONCAT(operation_name ORDER BY operation_date ASC), ',', 1) AS ipd_operation_name
-                FROM operation_list
-                WHERE patient_department = 'IPD'
-                GROUP BY hn
+                    o.hn,
+                    o.patient_department AS dept,
+                    MIN(o.operation_date) AS op_date,
+                    -- ใส่ operation_id เป็นตัวตัดสินตอนผ่าตัดหลายรายการวันเดียวกัน
+                    -- ไม่งั้นชื่อที่ได้จะสลับไปมาในแต่ละครั้งที่รัน
+                    SUBSTRING_INDEX(
+                        GROUP_CONCAT(o.operation_name ORDER BY o.operation_date ASC, o.operation_id ASC), ',', 1
+                    ) AS op_name
+                FROM operation_list o
+                WHERE o.patient_department IN ('OPD', 'IPD')
+                  AND o.hn IN (SELECT hn FROM visits)
+                GROUP BY o.hn, o.patient_department
             )
             SELECT
                 CONCAT(c.pname, c.fname, " ", c.lname) AS ptname,
-                b.hn,
-                a.icd10,
-                a.diagtype,
+                v.hn,
+                v.icd10,
+                v.diagtype,
                 d.cc,
-                b.vstdate,
-                OPD_Ops.opd_operation_date AS opd_operation,
-                OPD_Ops.opd_operation_name AS opd_operation_name,
-                DATEDIFF(b.vstdate, OPD_Ops.opd_operation_date) AS dd,
-                IPD_Ops.ipd_operation_date AS ipd_operation,
-                IPD_Ops.ipd_operation_name AS ipd_operation_name,
-                DATEDIFF(b.vstdate, IPD_Ops.ipd_operation_date) AS dd1,
-                a.vn
-            FROM ovstdiag a
-            LEFT JOIN ovst b ON b.vn = a.vn
-            LEFT JOIN patient c ON c.hn = b.hn
-            LEFT JOIN opdscreen d ON d.vn = a.vn
-            LEFT JOIN OPD_Ops ON b.hn = OPD_Ops.hn
-            LEFT JOIN IPD_Ops ON b.hn = IPD_Ops.hn
-            WHERE a.icd10 IN ('t814', 'a499')
-              AND b.vstdate BETWEEN ? AND ?
-              AND (DATEDIFF(b.vstdate, OPD_Ops.opd_operation_date) <= 45 OR DATEDIFF(b.vstdate, IPD_Ops.ipd_operation_date) <= 45);
+                v.vstdate,
+                od.op_date AS opd_operation,
+                od.op_name AS opd_operation_name,
+                DATEDIFF(v.vstdate, od.op_date) AS dd,
+                ip.op_date AS ipd_operation,
+                ip.op_name AS ipd_operation_name,
+                DATEDIFF(v.vstdate, ip.op_date) AS dd1,
+                v.vn
+            FROM visits v
+            LEFT JOIN patient c   ON c.hn = v.hn
+            LEFT JOIN opdscreen d ON d.vn = v.vn
+            LEFT JOIN ops od      ON od.hn = v.hn AND od.dept = 'OPD'
+            LEFT JOIN ops ip      ON ip.hn = v.hn AND ip.dept = 'IPD'
+            WHERE (DATEDIFF(v.vstdate, od.op_date) <= 45 OR DATEDIFF(v.vstdate, ip.op_date) <= 45)
         `;
 
         const [rows] = await his.execute<RowDataPacket[]>(sql, [date1, date2]);
@@ -415,5 +424,270 @@ export const getOpdPatientHistoryDaily = async ({ set }: Context) => {
             success: false,
             message: 'Internal Server Error'
         };
+    }
+};
+
+/**
+ * รายชื่อผู้ป่วยที่ตรวจพบเชื้อดื้อยา ตามช่วงวันที่ที่เลือก
+ *
+ * หนึ่งแถวคือหนึ่งผลเพาะเชื้อ ไม่ใช่หนึ่งคน เพราะผู้ป่วยรายเดียวอาจพบเชื้อหลายชนิด
+ * หรือพบซ้ำหลายครั้ง ซึ่งงาน IC ต้องเห็นแยกกันเพื่อไล่ทีละเหตุการณ์
+ */
+export const getAmrPatientReport = async (
+    { body, set }: { body: { date1: string, date2: string }, set: any }
+) => {
+    const { date1, date2 } = body ?? {};
+    const isDate = (v: unknown) => /^\d{4}-\d{2}-\d{2}$/.test(String(v ?? ''));
+
+    if (!isDate(date1) || !isDate(date2)) {
+        set.status = 400;
+        return { success: false, message: 'กรุณาระบุวันที่ในรูปแบบ YYYY-MM-DD' };
+    }
+    if (date1 > date2) {
+        set.status = 400;
+        return { success: false, message: 'วันที่เริ่มต้นต้องไม่เกินวันที่สิ้นสุด' };
+    }
+
+    // กันช่วงกว้างเกินจนดึงทั้งฐาน รายงานนี้เป็นรายบรรทัด ไม่ใช่ยอดรวม
+    const days = Math.floor((Date.parse(date2) - Date.parse(date1)) / 86400000) + 1;
+    if (days > 400) {
+        set.status = 400;
+        return { success: false, message: 'เลือกช่วงได้ไม่เกิน 400 วันต่อครั้ง' };
+    }
+
+    try {
+        const sql = `
+            SELECT
+                 -- คีย์แถวสำหรับหน้าจอ ข้อมูลต้นทางมีบางใบที่ interface ส่งซ้ำ
+                 -- เลข lab กับชื่อเชื้อจึงไม่พอจะแยกแถว ต้องใช้คีย์หลักของตาราง
+                 a.InterfaceResultID                                                      AS id
+                ,DATE_FORMAT(a.ConfirmDate, '%Y-%m-%d')                                   AS confirm_date
+                ,DATE_FORMAT(b.order_date, '%Y-%m-%d')                                    AS order_date
+                ,a.Hospital_LabNumber                                                     AS lab_no
+                ,a.HN                                                                     AS hn
+                ,CONCAT(IFNULL(p.pname,''), IFNULL(p.fname,''), ' ', IFNULL(p.lname,''))   AS ptname
+                ,p.sex                                                                    AS sex
+                ,TIMESTAMPDIFF(YEAR, p.birthday, a.ConfirmDate)                           AS age
+                /*
+                  ผูก AN ด้วยช่วงวันนอน เพราะใบ lab เก็บ vn ไม่ได้เก็บ an ไว้ตรงๆ
+
+                  ใช้คิวรีย่อยที่หยิบมาใบเดียว ไม่ใช่ LEFT JOIN เพราะผู้ป่วยบางรายมีทะเบียน
+                  นอนซ้อนกัน (จำหน่ายแล้วรับใหม่วันเดียวกัน) แล้ว join จะแตกผลเพาะเชื้อ
+                  หนึ่งครั้งออกเป็นสองบรรทัด ทำให้ยอดในรายงานเกินจริง
+
+                  แปลงชุดอักขระที่ฝั่ง a ซึ่งไม่มีดัชนี ไม่ใช่ปล่อยให้ตัวจัดการแปลงเอง
+                  และเทียบ dchdate ด้วย IS NULL แทนการครอบ IFNULL เพราะฟังก์ชันที่ครอบ
+                  คอลัมน์จะทำให้ดัชนีของคอลัมน์นั้นใช้ไม่ได้
+                */
+                ,(SELECT i.an FROM ipt i
+                   WHERE i.hn = CONVERT(a.HN USING tis620)
+                     AND a.ConfirmDate >= i.regdate
+                     AND (i.dchdate IS NULL OR a.ConfirmDate <= i.dchdate)
+                   ORDER BY i.regdate DESC LIMIT 1)                                       AS an
+                ,(SELECT w.name FROM ipt i JOIN ward w ON w.ward = i.ward
+                   WHERE i.hn = CONVERT(a.HN USING tis620)
+                     AND a.ConfirmDate >= i.regdate
+                     AND (i.dchdate IS NULL OR a.ConfirmDate <= i.dchdate)
+                   ORDER BY i.regdate DESC LIMIT 1)                                       AS ward_name
+                ,c.department                                                             AS department
+                ,a.Specimen                                                               AS specimen
+                ,TRIM(SUBSTRING_INDEX(a.ResultValue, '(', 1))                             AS organism
+                ,TRIM(SUBSTRING_INDEX(SUBSTRING_INDEX(a.ResultValue, '(', -1), ')', 1))   AS resistance
+                ,a.ResultValue                                                            AS result_value
+            FROM t_interface_result_bacteria a
+            LEFT JOIN lab_head b      ON b.lab_order_number = a.Hospital_LabNumber
+            LEFT JOIN kskdepartment c ON c.depcode = b.order_department
+            /*
+              ต้องแปลงชุดอักขระที่ฝั่ง a ซึ่งไม่มีดัชนี ไม่ใช่ปล่อยให้ MariaDB แปลงเอง
+
+              t_interface_result_bacteria.HN เป็น utf8mb3 ส่วน patient.hn กับ ipt.hn เป็น tis620
+              ถ้าเขียน p.hn = a.HN เฉยๆ ตัวจัดการจะแปลงคอลัมน์ที่มีดัชนี (tis620) ขึ้นเป็น utf8mb3
+              แล้วดัชนีใช้ไม่ได้ กลายเป็นอ่านทั้งตาราง 627,118 แถว
+              ของเดิมช่วง 1 เดือนใช้เวลา 22 วินาที พอย้ายฝั่งที่แปลงเหลือ 0.24 วินาที
+            */
+            LEFT JOIN patient p       ON p.hn = CONVERT(a.HN USING tis620)
+            WHERE a.ResultName LIKE 'or%'
+              AND a.ResultValue LIKE '%(%)%'
+              AND a.ConfirmDate BETWEEN ? AND ?
+            ORDER BY a.ConfirmDate DESC, a.Hospital_LabNumber
+        `;
+
+        const [rows] = await his.execute<RowDataPacket[]>(sql, [date1, date2]);
+
+        const data = rows.map(row => ({
+            id: Number(row.id),
+            confirm_date: row.confirm_date,
+            order_date: row.order_date,
+            lab_no: row.lab_no,
+            hn: row.hn,
+            ptname: sanitizeHTML(String(row.ptname ?? '').trim()) || null,
+            sex: row.sex === '1' ? 'ชาย' : row.sex === '2' ? 'หญิง' : null,
+            age: row.age === null ? null : Number(row.age),
+            an: row.an ?? null,
+            ward_name: row.ward_name ? sanitizeHTML(row.ward_name) : null,
+            department: row.department ? sanitizeHTML(cleanDepartment(String(row.department))) : null,
+            specimen: row.specimen ? sanitizeHTML(row.specimen) : null,
+            organism: sanitizeHTML(String(row.organism ?? '').trim()),
+            resistance: sanitizeHTML(String(row.resistance ?? '').trim()),
+        }));
+
+        // สรุปหัวรายงาน ให้ตรวจได้ทันทีว่าช่วงที่เลือกมีอะไรบ้าง โดยไม่ต้องไล่นับเอง
+        const distinct = <T>(arr: T[]) => new Set(arr.filter(Boolean)).size;
+        const byGroup = new Map<string, number>();
+        for (const r of data) {
+            const g = r.resistance || 'ไม่ระบุกลุ่ม';
+            byGroup.set(g, (byGroup.get(g) ?? 0) + 1);
+        }
+
+        return {
+            success: true,
+            data,
+            summary: {
+                total: data.length,
+                patients: distinct(data.map(r => r.hn)),
+                organisms: distinct(data.map(r => r.organism)),
+                admitted: data.filter(r => r.an).length,
+                by_resistance: [...byGroup.entries()]
+                    .map(([name, count]) => ({ name, count }))
+                    .sort((a, b) => b.count - a.count),
+            },
+        };
+    } catch (error) {
+        console.error('Get AMR patient report error:', error);
+        set.status = 500;
+        return { success: false, message: 'Internal Server Error' };
+    }
+};
+
+/** ชื่อหน่วยงานใน HIS มีรหัสต่อท้ายแบบ "หอผู้ป่วยอายุรกรรม 2 [1560,1535]" ซึ่งไม่ต้องแสดง */
+const cleanDepartment = (name: string) => name.replace(/\s*\[[^\]]*\]\s*$/, '').trim();
+
+const TOP_DEPARTMENTS = 10;
+const TOP_ORGANISMS = 8;
+
+// ป้ายของแต่ละคอลัมน์ต้องไม่ซ้ำกัน เพราะ echarts ใช้ชื่อ node เป็นคีย์เชื่อมเส้น
+// ถ้าใช้คำว่า "อื่นๆ" เหมือนกันทั้งสองคอลัมน์ เส้นจะวิ่งไปผิดที่
+const OTHER_DEPT = 'หน่วยงานอื่นๆ';
+const OTHER_ORG = 'เชื้ออื่นๆ';
+const LINK_SEP = '|::|';
+
+/**
+ * เส้นทางของเชื้อดื้อยาในปีงบประมาณปัจจุบัน สำหรับวาดกราฟ Sankey
+ *
+ * ไล่จาก หน่วยงานที่ส่งตรวจ → เชื้อก่อโรค → กลุ่มการดื้อยา
+ * เพื่อให้เห็นว่าเชื้อกลุ่มไหนกำลังมาจากหน่วยงานใด ไม่ใช่แค่ยอดรวมทั้งโรงพยาบาล
+ *
+ * รวมยอดและยุบกลุ่มย่อยฝั่งเซิร์ฟเวอร์ เพราะกฎการรวมเป็น "อื่นๆ" มีผลต่อตัวเลข
+ * ที่คนอ่านเอาไปใช้ ต้องอยู่ที่เดียวและทดสอบได้ ไม่ใช่กระจายอยู่ในโค้ดหน้าจอ
+ */
+export const getMdroSankeyFiscalYear = async ({ set }: Context) => {
+    try {
+        /*
+          ResultValue เก็บชื่อเชื้อพร้อมวงเล็บบอกการดื้อยา เช่น "Klebsiella pneumoniae(CRE,ESCR)"
+          จึงตัดเป็นสองส่วนตรงวงเล็บ ส่วนแถวที่ไม่มีวงเล็บคือเชื้อที่ยังไม่ดื้อยา ไม่นับมา
+
+          นับทั้งวงเล็บเป็นกลุ่มเดียว ไม่แยก CRE ออกจาก ESCR
+          เพราะ Sankey ต้องรักษายอดให้เท่ากันทุกคอลัมน์ ถ้าแยกหนึ่งเชื้อเป็นสองเส้น
+          ยอดคอลัมน์สุดท้ายจะบวมเกินจริง แล้วความกว้างของเส้นจะโกหกคนอ่าน
+        */
+        const sql = `
+            SELECT
+                 c.department
+                ,TRIM(SUBSTRING_INDEX(a.ResultValue, '(', 1))                            AS organism
+                ,TRIM(SUBSTRING_INDEX(SUBSTRING_INDEX(a.ResultValue, '(', -1), ')', 1))  AS resistance
+                ,COUNT(*) AS cc
+            FROM t_interface_result_bacteria a
+            JOIN lab_head b      ON b.lab_order_number = a.Hospital_LabNumber
+            JOIN kskdepartment c ON c.depcode = b.order_department
+            WHERE a.ResultName LIKE 'or%'
+              AND a.ResultValue LIKE '%(%)%'
+              AND c.department IS NOT NULL
+              -- ปีงบประมาณไทยเริ่ม 1 ต.ค. ถ้ายังไม่ถึงเดือน 10 แปลว่าอยู่ในปีงบที่เริ่มเมื่อปีที่แล้ว
+              AND a.ConfirmDate >= DATE_FORMAT(
+                    IF(MONTH(CURDATE()) >= 10, CURDATE(), DATE_SUB(CURDATE(), INTERVAL 1 YEAR)), '%Y-10-01')
+              AND a.ConfirmDate <= CURDATE()
+            GROUP BY c.department, organism, resistance
+        `;
+
+        const [rows] = await his.execute<RowDataPacket[]>(sql);
+
+        const records = rows.map(r => ({
+            department: cleanDepartment(String(r.department ?? '')) || 'ไม่ระบุหน่วยงาน',
+            organism: String(r.organism ?? '').trim() || 'ไม่ระบุเชื้อ',
+            resistance: String(r.resistance ?? '').trim() || 'ไม่ระบุกลุ่ม',
+            count: Number(r.cc) || 0,
+        }));
+
+        const total = records.reduce((s, r) => s + r.count, 0);
+
+        // เอาเฉพาะรายการที่ยอดสูงสุด ที่เหลือยุบเป็น "อื่นๆ" ไม่งั้นกราฟจะมีเส้นบางจนอ่านไม่ออก
+        const rankOf = (key: 'department' | 'organism') => {
+            const sum = new Map<string, number>();
+            for (const r of records) sum.set(r[key], (sum.get(r[key]) ?? 0) + r.count);
+            return [...sum.entries()].sort((a, b) => b[1] - a[1]).map(([name]) => name);
+        };
+
+        const deptRank = rankOf('department');
+        const orgRank = rankOf('organism');
+        const keepDept = new Set(deptRank.slice(0, TOP_DEPARTMENTS));
+        const keepOrg = new Set(orgRank.slice(0, TOP_ORGANISMS));
+
+        const depthOf = new Map<string, number>();
+        const nodeTotal = new Map<string, number>();
+        const linkTotal = new Map<string, number>();
+
+        const addNode = (name: string, depth: number, value: number) => {
+            depthOf.set(name, depth);
+            nodeTotal.set(name, (nodeTotal.get(name) ?? 0) + value);
+        };
+        const addLink = (source: string, target: string, value: number) => {
+            const key = source + LINK_SEP + target;
+            linkTotal.set(key, (linkTotal.get(key) ?? 0) + value);
+        };
+
+        for (const r of records) {
+            const dept = keepDept.has(r.department) ? r.department : OTHER_DEPT;
+            const org = keepOrg.has(r.organism) ? r.organism : OTHER_ORG;
+
+            // node ของคอลัมน์กลางถูกนับสองครั้งไม่ได้ ยอดขาเข้ากับขาออกเท่ากันอยู่แล้ว
+            addNode(dept, 0, r.count);
+            addNode(org, 1, r.count);
+            addNode(r.resistance, 2, r.count);
+            addLink(dept, org, r.count);
+            addLink(org, r.resistance, r.count);
+        }
+
+        const nodes = [...depthOf.entries()]
+            .map(([name, depth]) => ({ name: sanitizeHTML(name), depth, value: nodeTotal.get(name) ?? 0 }))
+            .sort((a, b) => a.depth - b.depth || b.value - a.value);
+
+        const links = [...linkTotal.entries()]
+            .map(([key, value]) => {
+                const [source, target] = key.split(LINK_SEP);
+                return { source: sanitizeHTML(source), target: sanitizeHTML(target), value };
+            })
+            .sort((a, b) => b.value - a.value);
+
+        // ปีงบ 2569 คือ 1 ต.ค. 2568 ถึง 30 ก.ย. 2569 จึงบวก 1 ปีจากปีที่เริ่มก่อนแปลงเป็น พ.ศ.
+        const now = new Date();
+        const startYear = now.getMonth() + 1 >= 10 ? now.getFullYear() : now.getFullYear() - 1;
+
+        return {
+            success: true,
+            data: {
+                fiscal_year: startYear + 1 + 543,
+                start_date: `${startYear}-10-01`,
+                end_date: `${startYear + 1}-09-30`,
+                total,
+                department_count: deptRank.length,
+                organism_count: orgRank.length,
+                nodes,
+                links,
+            },
+        };
+    } catch (error) {
+        console.error('Get MDRO sankey fiscal year error:', error);
+        set.status = 500;
+        return { success: false, message: 'Internal Server Error' };
     }
 };

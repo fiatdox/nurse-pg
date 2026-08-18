@@ -186,7 +186,21 @@ export const getFoodOrdersAddonByWard = async ({ body, set }: { body: { ward: st
                 m.name AS meal_name,
                 fi.food_name
             FROM food_orders fo
-            JOIN admission_list al ON fo.an = al.an AND al.discharge_type_id = 0
+            /*
+              หยิบทะเบียนผู้ป่วยในมาใบเดียว ไม่ใช่ JOIN ตรงๆ
+
+              พบว่ามี AN ที่มีทะเบียนค้างอยู่สองแถวโดยยังไม่จำหน่ายทั้งคู่
+              ถ้า join ธรรมดา รายการอาหารหนึ่งรายการจะถูกแตกเป็นสองแถว
+              ที่มี food_order_id เท่ากัน แล้วหน้าจอจะฟ้องว่าคีย์ซ้ำ
+              และถ้าแก้ addon จะยิงอัปเดตซ้ำสองครั้งกับรายการเดียวกัน
+            */
+            JOIN LATERAL (
+                SELECT al.bedno, al.patient_name
+                FROM admission_list al
+                WHERE al.an = fo.an AND al.discharge_type_id = 0
+                ORDER BY al.admission_list_id DESC
+                LIMIT 1
+            ) al ON TRUE
             JOIN food_items fi ON fo.food_item_id = fi.food_item_id
             JOIN meal m ON fo.meal = m.meal
             WHERE fo.ward = ${ward} AND fo.order_date = ${date} AND fo.meal = ${meal}
@@ -561,6 +575,198 @@ export const receiveFoodOrders = async (
         };
     } catch (error) {
         console.error('Receive food orders error:', error);
+        set.status = 500;
+        return { success: false, message: 'Internal Server Error' };
+    }
+};
+
+/**
+ * รายการสำหรับพิมพ์ฉลากติดถาดอาหาร
+ *
+ * หนึ่งแถวคือหนึ่งฉลาก = หนึ่งถาด เรียงตามหอผู้ป่วยแล้วตามเตียง
+ * เพราะคนติดฉลากทำงานไล่ไปทีละตึกทีละเตียง ถ้าเรียงตามชื่ออาหารจะต้องเดินย้อนไปมา
+ */
+export const getTrayLabels = async (
+    { body, set }: { body: { date: string, meal: number, ward?: string | null }, set: any }
+) => {
+    const { date, meal, ward } = body ?? {};
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date ?? '')) || ![1, 2, 3].includes(Number(meal))) {
+        set.status = 400;
+        return { success: false, message: 'กรุณาระบุ date (YYYY-MM-DD) และ meal (1-3) ให้ถูกต้อง' };
+    }
+
+    try {
+        const rows = await nurse`
+            SELECT
+                 fo.food_order_id
+                ,fo.ward
+                ,COALESCE(w.ward_name, 'ไม่ระบุหอผู้ป่วย') AS ward_name
+                ,al.bedno
+                ,al.an
+                ,al.hn
+                ,al.patient_name
+                ,fi.food_name
+                ,NULLIF(TRIM(fo.addon), '') AS addon
+                ,m.name AS meal_name
+            FROM food_orders fo
+            -- หยิบทะเบียนใบเดียวด้วยเหตุผลเดียวกับหน้า Addon คือมี AN ที่มีทะเบียนค้างซ้ำ
+            JOIN LATERAL (
+                SELECT a.bedno, a.an, a.hn, a.patient_name
+                FROM admission_list a
+                WHERE a.an = fo.an AND a.discharge_type_id = 0
+                ORDER BY a.admission_list_id DESC
+                LIMIT 1
+            ) al ON TRUE
+            JOIN food_items fi ON fi.food_item_id = fo.food_item_id
+            JOIN meal m        ON m.meal = fo.meal
+            LEFT JOIN ward w   ON w.his_code = fo.ward
+            WHERE fo.order_date = ${date}
+              AND fo.meal = ${Number(meal)}
+              AND fo.cancelled_at IS NULL
+              ${ward ? nurse`AND fo.ward = ${ward}` : nurse``}
+            ORDER BY w.ward_name NULLS LAST, al.bedno, al.an
+        `;
+
+        return {
+            success: true,
+            data: rows.map(r => ({
+                food_order_id: r.food_order_id,
+                ward: r.ward,
+                ward_name: sanitizeHTML(r.ward_name),
+                bedno: r.bedno ? sanitizeHTML(r.bedno) : null,
+                an: r.an,
+                hn: r.hn,
+                patient_name: sanitizeHTML(r.patient_name),
+                food_name: sanitizeHTML(r.food_name),
+                addon: sanitizeHTML(r.addon),
+                meal_name: sanitizeHTML(r.meal_name),
+            })),
+        };
+    } catch (error) {
+        console.error('Get tray labels error:', error);
+        set.status = 500;
+        return { success: false, message: 'Internal Server Error' };
+    }
+};
+
+/**
+ * สรุปยอดอาหารตามประเภท สำหรับหน้าแดชบอร์ดของงานโภชนาการ
+ *
+ * ประเภทอ่านจาก food_items.food_type_id ที่อ้าง food_types ไม่ใช่จากวงเล็บในชื่อ
+ * ของเดิมอ่านจากชื่อเพราะตารางประเภทยังว่าง ซึ่งพังเงียบ ๆ ได้ถ้าสะกดวงเล็บต่างไป
+ * COALESCE ไว้เผื่อเมนูที่ยังไม่ได้ระบุประเภท จะได้ไม่หายไปจากยอดรวม
+ */
+const FOOD_CLASS_SQL = `COALESCE(ft.food_type_name, 'ไม่ระบุประเภท')`;
+
+export const getFoodTypeDashboard = async (
+    { body, set }: { body: { date1: string, date2: string }, set: any }
+) => {
+    const { date1, date2 } = body ?? {};
+    const isDate = (v: unknown) => /^\d{4}-\d{2}-\d{2}$/.test(String(v ?? ''));
+
+    if (!isDate(date1) || !isDate(date2)) {
+        set.status = 400;
+        return { success: false, message: 'กรุณาระบุวันที่ในรูปแบบ YYYY-MM-DD' };
+    }
+    if (date1 > date2) {
+        set.status = 400;
+        return { success: false, message: 'วันที่เริ่มต้นต้องไม่เกินวันที่สิ้นสุด' };
+    }
+
+    const days = Math.floor((Date.parse(date2) - Date.parse(date1)) / 86400000) + 1;
+    if (days > 400) {
+        set.status = 400;
+        return { success: false, message: 'เลือกช่วงได้ไม่เกิน 400 วันต่อครั้ง' };
+    }
+
+    try {
+        /*
+          MATERIALIZED เพื่อให้ CTE ถูกคำนวณรอบเดียว
+          ถ้าปล่อยให้ตัวจัดการแทรกเข้าไปในทุกคิวรีย่อย จะกลายเป็นอ่านตารางซ้ำสี่รอบ
+        */
+        const rows = await nurse.unsafe(`
+            WITH src AS MATERIALIZED (
+                SELECT
+                     fo.order_date
+                    ,fo.meal
+                    ,fo.an
+                    ,fo.ward
+                    ,${FOOD_CLASS_SQL} AS class
+                    -- ตัดวงเล็บประเภทห้องท้ายชื่อออก ให้เหลือชนิดอาหารล้วน
+                    -- ใช้ [(] [)] แทน \( \) เพราะ backslash ในสตริงของ TS ถูกกลืนไปหนึ่งชั้น
+                    -- แล้วกลายเป็น regex คนละตัวโดยไม่มีใครรู้ (ของเดิมคืนชื่อเต็มมาเฉยๆ)
+                    ,btrim(regexp_replace(fi.food_name, '[[:space:]]*[(][^)]*[)][[:space:]]*$', '')) AS diet
+                FROM food_orders fo
+                JOIN food_items fi ON fi.food_item_id = fo.food_item_id
+                LEFT JOIN food_types ft ON ft.food_type_id = fi.food_type_id
+                WHERE fo.cancelled_at IS NULL
+                  AND fo.order_date BETWEEN $1 AND $2
+            )
+            SELECT
+                 (SELECT COUNT(*)::int FROM src)                        AS total
+                ,(SELECT COUNT(DISTINCT order_date)::int FROM src)      AS days
+                ,(SELECT COUNT(DISTINCT an)::int FROM src)              AS patients
+                ,(SELECT COUNT(DISTINCT ward)::int FROM src)            AS wards
+                ,(SELECT COALESCE(json_agg(t), '[]') FROM (
+                    SELECT class AS name, COUNT(*)::int AS qty
+                    FROM src GROUP BY 1 ORDER BY 2 DESC, 1) t)          AS by_class
+                ,(SELECT COALESCE(json_agg(t), '[]') FROM (
+                    SELECT diet AS name, COUNT(*)::int AS qty
+                    FROM src GROUP BY 1 ORDER BY 2 DESC, 1) t)          AS by_diet
+                ,(SELECT COALESCE(json_agg(t), '[]') FROM (
+                    SELECT meal, class, COUNT(*)::int AS qty
+                    FROM src GROUP BY 1, 2 ORDER BY 1, 2) t)            AS by_meal
+                ,(SELECT COALESCE(json_agg(t), '[]') FROM (
+                    SELECT to_char(order_date, 'YYYY-MM-DD') AS date, class, COUNT(*)::int AS qty
+                    FROM src GROUP BY 1, 2 ORDER BY 1, 2) t)            AS daily
+                ,(SELECT COALESCE(json_agg(t), '[]') FROM (
+                    SELECT COALESCE(w.ward_name, 'ไม่ระบุหอผู้ป่วย') AS ward_name,
+                           src.class, COUNT(*)::int AS qty
+                    FROM src LEFT JOIN ward w ON w.his_code = src.ward
+                    GROUP BY 1, 2 ORDER BY 3 DESC) t)                   AS by_ward
+                /*
+                  สามชั้นในแถวเดียว สำหรับกราฟ Sankey มื้อ → หอผู้ป่วย → ประเภทห้อง
+                  ส่งเป็นยอดดิบให้หน้าจอต่อเส้นเอง เพราะจำนวนหอไม่มาก
+                  ไม่ต้องยุบเป็น "อื่นๆ" เหมือนกราฟเชื้อดื้อยาที่มี 41 หน่วยงาน
+                */
+                ,(SELECT COALESCE(json_agg(t), '[]') FROM (
+                    SELECT src.meal,
+                           COALESCE(w.ward_name, 'ไม่ระบุหอผู้ป่วย') AS ward_name,
+                           src.class, COUNT(*)::int AS qty
+                    FROM src LEFT JOIN ward w ON w.his_code = src.ward
+                    GROUP BY 1, 2, 3 ORDER BY 4 DESC) t)                AS meal_ward_class
+        `, [date1, date2]);
+
+        const r = rows[0];
+        const clean = <T extends { name?: string; ward_name?: string }>(arr: T[]) =>
+            arr.map(x => ({
+                ...x,
+                ...(x.name !== undefined ? { name: sanitizeHTML(x.name) } : {}),
+                ...(x.ward_name !== undefined ? { ward_name: sanitizeHTML(x.ward_name) } : {}),
+            }));
+
+        return {
+            success: true,
+            data: {
+                start_date: date1,
+                end_date: date2,
+                summary: {
+                    total: r.total,
+                    days: r.days,
+                    patients: r.patients,
+                    wards: r.wards,
+                },
+                by_class: clean(r.by_class),
+                by_diet: clean(r.by_diet),
+                by_meal: r.by_meal,
+                daily: r.daily,
+                by_ward: clean(r.by_ward),
+                meal_ward_class: clean(r.meal_ward_class),
+            },
+        };
+    } catch (error) {
+        console.error('Get food type dashboard error:', error);
         set.status = 500;
         return { success: false, message: 'Internal Server Error' };
     }

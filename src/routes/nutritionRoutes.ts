@@ -10,9 +10,16 @@ import {
     cancelOrderMenu,
     getFoodOrderHistoryByAN,
     getNutritionAccess,
+    getFoodTypeDashboard,
+    getTrayLabels,
     getDailyFoodSummary,
     receiveFoodOrders
 } from '../controllers/nutritionController';
+import {
+    listFoodItems,
+    createFoodItems,
+    setFoodItemActive
+} from '../controllers/foodItemController';
 
 export const nutritionRoutes = new Elysia({ prefix: '/api/v1/nutrition' })
     .use(authMiddleware)
@@ -76,6 +83,18 @@ export const nutritionRoutes = new Elysia({ prefix: '/api/v1/nutrition' })
         body: t.Object({ date: t.String() }),
         detail: { summary: 'สรุปรายการอาหารประจำวัน แยกตามมื้อ หอผู้ป่วย และเมนู' }
     })
+    .post('/food-type-dashboard', getFoodTypeDashboard, {
+        body: t.Object({ date1: t.String(), date2: t.String() }),
+        detail: { summary: 'สรุปยอดอาหารตามประเภทห้อง ชนิดอาหาร มื้อ วัน และหอผู้ป่วย สำหรับแดชบอร์ดงานโภชนาการ' }
+    })
+    .post('/tray-labels', getTrayLabels, {
+        body: t.Object({
+            date: t.String(),
+            meal: t.Number(),
+            ward: t.Optional(t.Union([t.String(), t.Null()]))
+        }),
+        detail: { summary: 'รายการสำหรับพิมพ์ฉลากติดถาดอาหาร เรียงตามหอผู้ป่วยและเตียง' }
+    })
     .post('/receive-orders', receiveFoodOrders, {
         body: t.Object({
             ward: t.String(),
@@ -84,4 +103,21 @@ export const nutritionRoutes = new Elysia({ prefix: '/api/v1/nutrition' })
             undo: t.Optional(t.Boolean())
         }),
         detail: { summary: 'งานโภชนาการรับรายการอาหารรายหอผู้ป่วยต่อมื้อ (undo = ถอนการรับ)' }
+    })
+    .get('/food-items', listFoodItems, {
+        detail: { summary: 'ทะเบียนเมนูอาหารทั้งหมด รวมที่ปิดใช้งานแล้ว พร้อมยอดการสั่ง' }
+    })
+    .post('/food-items', createFoodItems, {
+        body: t.Object({
+            food_name: t.String(),
+            classes: t.Array(t.String(), { minItems: 1 })
+        }),
+        detail: { summary: 'เพิ่มเมนูอาหาร สร้างหนึ่งแถวต่อหนึ่งประเภทห้องที่เลือก (สามัญ / พิเศษ / VIP)' }
+    })
+    .patch('/food-items/active', setFoodItemActive, {
+        body: t.Object({
+            food_item_id: t.Number(),
+            is_active: t.Boolean()
+        }),
+        detail: { summary: 'เปิด/ปิดการใช้งานเมนูอาหาร (ไม่ลบแถว เพราะรายการสั่งย้อนหลังอ้างถึงอยู่)' }
     })
