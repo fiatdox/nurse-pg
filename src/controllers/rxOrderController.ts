@@ -8,6 +8,7 @@ import { resolveActor } from '../utils/nursingRecord';
 import { sanitizeHTML } from '../utils/sanitize';
 import { padHn } from '../utils/hn';
 import { admissionsOf, hisWardCode } from './rxHnReaderController';
+import { retentionDays } from './rxRetentionController';
 import { emitRxOrder, type RxStatus } from '../realtime';
 
 /**
@@ -417,6 +418,9 @@ export const listRxOrders = async ({ query, user, set }: Context & { user?: unkn
                    o.resend_of, o.tube_feed,
                    o.rejected_by_name,  TO_CHAR(o.rejected_at,  'YYYY-MM-DD HH24:MI') AS rejected_at,
                    (SELECT COUNT(*)::int FROM rx_order_files f WHERE f.rx_order_id = o.rx_order_id) AS file_count,
+                   /* ไฟล์ภาพถูกลบตามกำหนดแล้วทุกไฟล์ หน้าจอใช้ติดป้ายบอกก่อนเปิดใบ */
+                   NOT EXISTS (SELECT 1 FROM rx_order_files f
+                               WHERE f.rx_order_id = o.rx_order_id AND f.purged_at IS NULL) AS files_purged,
                    EXTRACT(EPOCH FROM (now() - o.submitted_at))::int AS waiting_seconds
             FROM rx_orders o
             LEFT JOIN ward w ON w.ward = o.ward
@@ -472,7 +476,8 @@ export const getRxOrder = async ({ params, user, set }: Context & { user?: unkno
         }
 
         const files = await nurse`
-            SELECT rx_file_id, file_no, original_name, mime_type, byte_size
+            SELECT rx_file_id, file_no, original_name, mime_type, byte_size,
+                   TO_CHAR(purged_at, 'YYYY-MM-DD HH24:MI') AS purged_at
             FROM rx_order_files WHERE rx_order_id = ${id} ORDER BY file_no
         `;
         const events = await nurse`
@@ -480,7 +485,10 @@ export const getRxOrder = async ({ params, user, set }: Context & { user?: unkno
             FROM rx_order_events WHERE rx_order_id = ${id} ORDER BY at
         `;
 
-        return { success: true, data: { ...rows[0], files, events } };
+        return {
+            success: true,
+            data: { ...rows[0], files, events, file_retention_days: await retentionDays() },
+        };
     } catch (error) {
         console.error('Get rx order error:', error);
         set.status = 500;
@@ -504,12 +512,28 @@ export const getRxOrderFile = async ({ params, user, set }: Context & { user?: u
     try {
         /* ผูกกับ rx_order_id ด้วย ไม่ให้เดาเลขไฟล์แล้วดึงไฟล์ของใบอื่นได้ */
         const rows = await nurse`
-            SELECT stored_path, mime_type, original_name
+            SELECT stored_path, mime_type, original_name,
+                   /* ปี พ.ศ. ให้ตรงกับวันที่ที่ผู้ใช้เห็นในหน้าจออื่น */
+                   TO_CHAR(purged_at, 'DD/MM/') || (EXTRACT(YEAR FROM purged_at)::int + 543) AS purged_on
             FROM rx_order_files WHERE rx_file_id = ${fileId} AND rx_order_id = ${id}
         `;
         if (rows.length === 0) {
             set.status = 404;
             return { success: false, message: 'ไม่พบไฟล์' };
+        }
+
+        /*
+          410 ไม่ใช่ 404: ไฟล์เคยมีจริงและถูกลบโดยตั้งใจ หน้าจอจะได้บอกผู้ใช้ตามนั้น
+          ไม่ต้องบันทึกการเปิดดู เพราะไม่มีข้อมูลผู้ป่วยถูกส่งออกไป
+        */
+        if (rows[0].purged_on) {
+            set.status = 410;
+            return {
+                success: false,
+                purged: true,
+                message: `ไฟล์นี้ถูกลบออกจากระบบแล้วเมื่อ ${rows[0].purged_on} `
+                    + `ตามระยะเวลาจัดเก็บไฟล์ ${await retentionDays()} วัน`,
+            };
         }
 
         const f = Bun.file(String(rows[0].stored_path));

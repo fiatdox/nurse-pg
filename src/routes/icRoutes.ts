@@ -13,8 +13,9 @@ export const icRoutes = new Elysia({ prefix: '/api/v1/ic' })
         }),
         detail: { summary: 'ผู้ป่วยนอกที่มารับบริการในวันที่เลือก และมีผลเพาะเชื้อดื้อยาย้อนหลัง 90 วัน' }
     })
-    .get('/result-in-fiscal-year', getResultInFiscalYear)
-    .get('/result-dep-in-fiscal-year', getResultDepInFiscalYear)
+    /* ?fy=2568 = ปีงบประมาณ พ.ศ. ที่ต้องการ ไม่ส่ง = ปีงบปัจจุบัน */
+    .get('/result-in-fiscal-year', getResultInFiscalYear, { query: t.Object({ fy: t.Optional(t.String()) }), })
+    .get('/result-dep-in-fiscal-year', getResultDepInFiscalYear, { query: t.Object({ fy: t.Optional(t.String()) }), })
     .post('/amr-patient-report', getAmrPatientReport, {
         body: t.Object({
             date1: t.String(),
@@ -29,7 +30,8 @@ export const icRoutes = new Elysia({ prefix: '/api/v1/ic' })
         detail: { summary: 'ผู้ป่วยนอกที่มีนัดในวันที่เลือก และยังอยู่ในช่วงเฝ้าระวังเชื้อดื้อยา 90 วัน' }
     })
     .get('/mdro-sankey-fiscal-year', getMdroSankeyFiscalYear, {
-        detail: { summary: 'เส้นทางเชื้อดื้อยาปีงบประมาณปัจจุบัน หน่วยงาน → เชื้อ → กลุ่มดื้อยา (สำหรับกราฟ Sankey)' }
+        query: t.Object({ fy: t.Optional(t.String()) }),
+        detail: { summary: 'เส้นทางเชื้อดื้อยาตามปีงบประมาณ (?fy=พ.ศ. ไม่ส่ง = ปีปัจจุบัน) หน่วยงาน → เชื้อ → กลุ่มดื้อยา (สำหรับกราฟ Sankey)' }
     })
     .post('/operation-followup', operationFollowup, {
         body: t.Object({

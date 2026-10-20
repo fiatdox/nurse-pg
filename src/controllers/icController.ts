@@ -249,8 +249,50 @@ export const operationFollowup = async ({ body, set }: Context) => {
     }
 };
 
-// ฟังก์ชันสำหรับดึงข้อมูลสรุปจำนวนผู้ป่วยติดเชื้อดื้อยาแยกตามแผนกในปีงบประมาณปัจจุบัน
-export const getResultDepInFiscalYear = async ({ set }: Context) => {
+/* ───────────────────────── ปีงบประมาณ ───────────────────────── */
+
+/** ปีงบที่เก่าที่สุดที่ยอมให้เลือก กันค่าแปลก ๆ ไม่ใช่ขอบเขตของข้อมูลจริง */
+const FY_MIN = 2560;
+
+const ymd = (d: Date) =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+/**
+ * ปีงบประมาณ พ.ศ. → ช่วงวันที่ ค.ศ.
+ *
+ * ปีงบ 2569 = 1 ต.ค. 2568 ถึง 30 ก.ย. 2569 (ค.ศ. 2025-10-01 ถึง 2026-09-30)
+ * ไม่ส่งมาหรือค่าผิด = ปีงบปัจจุบัน ปีงบที่ยังไม่เริ่มก็ใช้ปีงบปัจจุบันแทน
+ * until = วันสุดท้ายที่นับจริง ปีงบปัจจุบันตัดที่วันนี้ ปีงบที่จบแล้วใช้ 30 ก.ย.
+ */
+export const fiscalRange = (raw: unknown) => {
+    const now = new Date();
+    const currentStart = now.getMonth() + 1 >= 10 ? now.getFullYear() : now.getFullYear() - 1;
+    const current = currentStart + 1 + 543;
+    const want = Number(raw);
+    const fy = Number.isInteger(want) && want >= FY_MIN && want <= current ? want : current;
+    const startYear = fy - 543 - 1;
+    const end = `${startYear + 1}-09-30`;
+    return {
+        fy,
+        current,
+        start: `${startYear}-10-01`,
+        end,
+        until: fy === current ? ymd(now) : end,
+    };
+};
+
+/** ข้อมูลปีงบที่ส่งกลับไปพร้อมผล หน้าจอจะได้แสดงช่วงวันที่ตามที่เซิร์ฟเวอร์ใช้จริง */
+const fiscalMeta = (r: ReturnType<typeof fiscalRange>) => ({
+    fiscal_year: r.fy,
+    current_fiscal_year: r.current,
+    start_date: r.start,
+    end_date: r.end,
+    until_date: r.until,
+});
+
+// ฟังก์ชันสำหรับดึงข้อมูลสรุปจำนวนผู้ป่วยติดเชื้อดื้อยาแยกตามแผนกในปีงบประมาณที่เลือก
+export const getResultDepInFiscalYear = async ({ query, set }: Context) => {
+    const range = fiscalRange((query as { fy?: string } | undefined)?.fy);
     try {
         const sql = `
             SELECT 
@@ -268,21 +310,18 @@ export const getResultDepInFiscalYear = async ({ set }: Context) => {
                 a.ResultValue LIKE '%MRSA%'
               )
               AND c.department IS NOT NULL
-              -- กรองตามปีงบประมาณไทย (เริ่ม 1 ต.ค. ของปีงบประมาณนั้น)
-              AND a.ConfirmDate BETWEEN 
-                (CASE 
-                    WHEN MONTH(CURDATE()) >= 10 THEN CONCAT(YEAR(CURDATE()), '-10-01')
-                    ELSE CONCAT(YEAR(CURDATE()) - 1, '-10-01')
-                END)
-                AND CURDATE()
+              -- ปีงบประมาณที่เลือก ใช้ < วันถัดไป เพื่อให้นับผลที่ยืนยันระหว่างวันของวันสุดท้ายด้วย
+              AND a.ConfirmDate >= ?
+              AND a.ConfirmDate < DATE_ADD(?, INTERVAL 1 DAY)
             GROUP BY c.department
             ORDER BY cc DESC;
         `;
 
-        const [rows] = await his.execute<RowDataPacket[]>(sql);
+        const [rows] = await his.execute<RowDataPacket[]>(sql, [range.start, range.until]);
 
         return {
             success: true,
+            ...fiscalMeta(range),
             data: rows.map(row => ({
                 ...row,
                 department: row.department ? sanitizeHTML(row.department) : null
@@ -299,7 +338,8 @@ export const getResultDepInFiscalYear = async ({ set }: Context) => {
 };
 
 // ฟังก์ชันสำหรับดึงข้อมูลสรุปจำนวนผู้ป่วยติดเชื้อดื้อยาในปีงบประมาณปัจจุบัน
-export const getResultInFiscalYear = async ({ set }: Context) => {
+export const getResultInFiscalYear = async ({ query, set }: Context) => {
+    const range = fiscalRange((query as { fy?: string } | undefined)?.fy);
     try {
         const sql = `
             SELECT
@@ -313,11 +353,14 @@ export const getResultInFiscalYear = async ({ set }: Context) => {
                     a.ConfirmDate,
                     b.order_date,
                     -- Fiscal month order for correct sorting: Oct=1, Nov=2, ..., Sep=12
+                    -- ผลที่หาใบสั่งตรวจไม่เจอ (ไม่มีแถวใน lab_head) ใช้วันยืนยันผลแทน
+                    -- ถ้าปล่อยเป็น NULL กราฟจะเจอเดือนว่างเป็นตัวแรกแล้วตัดทิ้งทั้งปี (เจอในปีงบ 2568 จำนวน 4 รายการ)
                     CASE
-                        WHEN MONTH(b.order_date) >= 10 THEN MONTH(b.order_date) - 9
-                        ELSE MONTH(b.order_date) + 3
+                        WHEN MONTH(COALESCE(b.order_date, a.ConfirmDate)) >= 10
+                            THEN MONTH(COALESCE(b.order_date, a.ConfirmDate)) - 9
+                        ELSE MONTH(COALESCE(b.order_date, a.ConfirmDate)) + 3
                     END AS fiscal_month_order,
-                    MONTHNAME(b.order_date) AS monthName
+                    MONTHNAME(COALESCE(b.order_date, a.ConfirmDate)) AS monthName
                 FROM
                     t_interface_result_bacteria a
                 LEFT OUTER JOIN lab_head b ON b.lab_order_number = a.Hospital_LabNumber
@@ -325,13 +368,9 @@ export const getResultInFiscalYear = async ({ set }: Context) => {
                 WHERE
                     a.ResultName LIKE 'or%'
                     AND (a.ResultValue LIKE '%MDR%' OR a.ResultValue LIKE '%CRE%' OR a.ResultValue LIKE '%ESCR%' OR a.ResultValue LIKE '%VRE%' OR a.ResultValue LIKE '%MRSA%' OR a.ResultValue LIKE '%CRE,ESCR%')
-                    -- Dynamic date filter for current Thai Fiscal Year based on ConfirmDate
-                    AND a.ConfirmDate BETWEEN 
-                        -- Start Date: Oct 1st of the previous calendar year if current month < 10, else current calendar year
-                        DATE_FORMAT(IF(MONTH(CURDATE()) >= 10, CURDATE(), DATE_SUB(CURDATE(), INTERVAL 1 YEAR)), '%Y-10-01')
-                        AND 
-                        -- End Date: Sep 30th of the current calendar year if current month < 10, else next calendar year
-                        DATE_FORMAT(IF(MONTH(CURDATE()) >= 10, DATE_ADD(CURDATE(), INTERVAL 1 YEAR), CURDATE()), '%Y-09-30')
+                    -- ปีงบประมาณที่เลือก นับตามวันที่ยืนยันผล (< วันถัดไป เพื่อให้รวมผลระหว่างวันของวันสุดท้าย)
+                    AND a.ConfirmDate >= ?
+                    AND a.ConfirmDate < DATE_ADD(?, INTERVAL 1 DAY)
             ) AS x
             GROUP BY
                 x.ResultValue, x.fiscal_month_order, x.monthName
@@ -339,10 +378,11 @@ export const getResultInFiscalYear = async ({ set }: Context) => {
                 x.fiscal_month_order asc, x.ResultValue;
         `;
 
-        const [rows] = await his.execute<RowDataPacket[]>(sql);
+        const [rows] = await his.execute<RowDataPacket[]>(sql, [range.start, range.until]);
 
         return {
             success: true,
+            ...fiscalMeta(range),
             data: rows.map(row => ({
                 ...row,
                 ResultValue: row.ResultValue ? sanitizeHTML(row.ResultValue) : null,
@@ -602,7 +642,8 @@ const LINK_SEP = '|::|';
  * รวมยอดและยุบกลุ่มย่อยฝั่งเซิร์ฟเวอร์ เพราะกฎการรวมเป็น "อื่นๆ" มีผลต่อตัวเลข
  * ที่คนอ่านเอาไปใช้ ต้องอยู่ที่เดียวและทดสอบได้ ไม่ใช่กระจายอยู่ในโค้ดหน้าจอ
  */
-export const getMdroSankeyFiscalYear = async ({ set }: Context) => {
+export const getMdroSankeyFiscalYear = async ({ query, set }: Context) => {
+    const range = fiscalRange((query as { fy?: string } | undefined)?.fy);
     try {
         /*
           ResultValue เก็บชื่อเชื้อพร้อมวงเล็บบอกการดื้อยา เช่น "Klebsiella pneumoniae(CRE,ESCR)"
@@ -624,14 +665,13 @@ export const getMdroSankeyFiscalYear = async ({ set }: Context) => {
             WHERE a.ResultName LIKE 'or%'
               AND a.ResultValue LIKE '%(%)%'
               AND c.department IS NOT NULL
-              -- ปีงบประมาณไทยเริ่ม 1 ต.ค. ถ้ายังไม่ถึงเดือน 10 แปลว่าอยู่ในปีงบที่เริ่มเมื่อปีที่แล้ว
-              AND a.ConfirmDate >= DATE_FORMAT(
-                    IF(MONTH(CURDATE()) >= 10, CURDATE(), DATE_SUB(CURDATE(), INTERVAL 1 YEAR)), '%Y-10-01')
-              AND a.ConfirmDate <= CURDATE()
+              -- ปีงบประมาณที่เลือก (ดู fiscalRange)
+              AND a.ConfirmDate >= ?
+              AND a.ConfirmDate < DATE_ADD(?, INTERVAL 1 DAY)
             GROUP BY c.department, organism, resistance
         `;
 
-        const [rows] = await his.execute<RowDataPacket[]>(sql);
+        const [rows] = await his.execute<RowDataPacket[]>(sql, [range.start, range.until]);
 
         const records = rows.map(r => ({
             department: cleanDepartment(String(r.department ?? '')) || 'ไม่ระบุหน่วยงาน',
@@ -690,16 +730,10 @@ export const getMdroSankeyFiscalYear = async ({ set }: Context) => {
             })
             .sort((a, b) => b.value - a.value);
 
-        // ปีงบ 2569 คือ 1 ต.ค. 2568 ถึง 30 ก.ย. 2569 จึงบวก 1 ปีจากปีที่เริ่มก่อนแปลงเป็น พ.ศ.
-        const now = new Date();
-        const startYear = now.getMonth() + 1 >= 10 ? now.getFullYear() : now.getFullYear() - 1;
-
         return {
             success: true,
             data: {
-                fiscal_year: startYear + 1 + 543,
-                start_date: `${startYear}-10-01`,
-                end_date: `${startYear + 1}-09-30`,
+                ...fiscalMeta(range),
                 total,
                 department_count: deptRank.length,
                 organism_count: orgRank.length,

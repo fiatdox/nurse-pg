@@ -20,6 +20,7 @@ import { holidayRoutes } from "./routes/holidayRoutes";
 import { vendorRoutes } from "./routes/vendorRoutes";
 import { rxOrderRoutes } from "./routes/rxOrderRoutes";
 import { rxRealtimeRoutes, setRealtimeServer } from "./realtime";
+import { startRxRetention } from "./controllers/rxRetentionController";
 import { vendorAdminRoutes } from "./routes/vendorAdminRoutes";
 
 const app = new Elysia()
@@ -92,6 +93,9 @@ const app = new Elysia()
 
 /* ตัวเซิร์ฟเวอร์ใช้ส่งข้อความจากนอก handler เช่นตอนบันทึกใบสั่งยาเสร็จใน REST */
 setRealtimeServer(app.server);
+
+/* ลบไฟล์ภาพใบสั่งยาที่เก็บครบกำหนด (ค่าตั้งใน system_settings) รอบแรกหลังเปิดเครื่อง 1 นาที แล้วทุก 6 ชั่วโมง */
+startRxRetention();
 
 console.log(
   `🦊 Elysia is running at ${app.server?.hostname}:${app.server?.port}`
