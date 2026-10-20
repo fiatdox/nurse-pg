@@ -89,7 +89,8 @@ const app = new Elysia()
   */
   .use(rxRealtimeRoutes)
 
-  .listen(4000);
+  /* พอร์ตตั้งใน .env ด้วย PORT ได้ ไม่ตั้ง = 4001 (frontend ใช้ 4002) */
+  .listen(Number(process.env.PORT) || 4001);
 
 /* ตัวเซิร์ฟเวอร์ใช้ส่งข้อความจากนอก handler เช่นตอนบันทึกใบสั่งยาเสร็จใน REST */
 setRealtimeServer(app.server);

@@ -8,7 +8,7 @@ import { cors } from '@elysiajs/cors';
 export const corsMiddleware = (app: Elysia) =>
     app.use(
         cors({
-            origin: process.env.CORS_ORIGINS?.split(',') || ['http://localhost:4000'],
+            origin: process.env.CORS_ORIGINS?.split(',') || ['http://localhost:4002'],
             credentials: true,
             methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
             allowedHeaders: ['Content-Type', 'Authorization'],

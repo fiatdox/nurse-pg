@@ -8,7 +8,7 @@ Elysia web framework on the Bun runtime, TypeScript with `strict: true`. The pro
 
 ## Commands
 
-- `bun run dev` — run the server with file watching (entry: [src/index.ts](src/index.ts), port 3000)
+- `bun run dev` — run the server with file watching (entry: [src/index.ts](src/index.ts), port 4001 — override with `PORT` in `.env`; the Next.js frontend runs on 4002)
 - `bun install` — install dependencies (lockfile is `bun.lock`, not `package-lock.json`)
 - No test runner is wired up yet; the `test` script is the placeholder from `bun init`.
 
