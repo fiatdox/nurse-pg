@@ -1,0 +1,193 @@
+import { Context } from 'elysia';
+import { join, resolve, sep } from 'path';
+import { unlink } from 'fs/promises';
+import { nurse } from '../db';
+import { isAdmin, readSetting } from './systemSettingsController';
+
+/**
+ * ระยะเวลาจัดเก็บไฟล์ใบสั่งยา
+ *
+ * ไฟล์ภาพที่หอสแกนส่งมาเก็บไว้ตามจำนวนวันที่ตั้ง ครบแล้วลบออกจากดิสก์
+ * ลบเฉพาะไฟล์ ไม่ลบแถวในฐานข้อมูล ใบสั่งยา ชื่อผู้ป่วย สถานะ และประวัติการเปิดดูยังอยู่ครบ
+ * (ใบสั่งยาตัวจริงอยู่ในแฟ้มผู้ป่วยและถูกคีย์ลง HIS แล้ว ภาพนี้เป็นสำเนาที่ใช้ส่งงานเท่านั้น)
+ */
+
+const SETTING_KEY = 'rx_file_retention';
+export const RETENTION_DEFAULT = 120;
+
+/*
+  ขั้นต่ำ 30 วัน กันพิมพ์ผิดเป็น 1 หรือ 0 แล้วไฟล์ทั้งระบบหายในรอบถัดไป
+  การลบย้อนกลับไม่ได้ จึงไม่ยอมให้ตั้งค่าที่สั้นจนไม่มีใครทันสังเกต
+*/
+export const RETENTION_MIN = 30;
+export const RETENTION_MAX = 3650;
+
+/** ทุกกี่ชั่วโมงไปไล่ลบ ถี่กว่าวันละครั้งเพื่อให้รอบที่พลาดเพราะ restart ถูกชดเชยเร็ว */
+const RUN_EVERY_MS = 6 * 60 * 60 * 1000;
+const BATCH = 200;
+
+const UPLOAD_ROOT = resolve(process.env.RX_UPLOAD_DIR || join(process.cwd(), 'uploads', 'rx'));
+
+export const retentionDays = async (): Promise<number> => {
+    const v = await readSetting<{ days?: number }>(SETTING_KEY, { days: RETENTION_DEFAULT });
+    const d = Number(v?.days);
+    return Number.isInteger(d) && d >= RETENTION_MIN && d <= RETENTION_MAX ? d : RETENTION_DEFAULT;
+};
+
+/** ไฟล์ที่ยังไม่ถูกลบและเก่ากว่ากำหนด = จะถูกลบในรอบถัดไป */
+const countDue = async (days: number) => {
+    const r = await nurse`
+        SELECT COUNT(*)::int AS files, COUNT(DISTINCT rx_order_id)::int AS orders,
+               COALESCE(SUM(byte_size), 0)::bigint AS bytes
+        FROM rx_order_files
+        WHERE purged_at IS NULL AND uploaded_at < now() - make_interval(days => ${days})
+    `;
+    return { files: Number(r[0].files), orders: Number(r[0].orders), bytes: Number(r[0].bytes) };
+};
+
+let running = false;
+let lastRun: { at: string; files: number; skipped: number } | null = null;
+
+/**
+ * ลบไฟล์ที่ครบกำหนด
+ *
+ * ทีละชุด ลบไฟล์ก่อนแล้วค่อยตั้ง purged_at เพื่อให้ "บันทึกว่าลบแล้ว" ตรงกับดิสก์จริงเสมอ
+ * ถ้าเครื่องดับกลางทาง แถวที่ยังไม่ได้ตั้งจะถูกหยิบมาทำใหม่รอบหน้า (ไฟล์ที่หายไปแล้วถือว่าลบสำเร็จ)
+ */
+export const purgeExpiredRxFiles = async () => {
+    if (running) return null;
+    running = true;
+    let files = 0;
+    let skipped = 0;
+    try {
+        const days = await retentionDays();
+        const seen = new Set<string>();
+        for (;;) {
+            const rows = await nurse`
+                SELECT rx_file_id, rx_order_id, stored_path
+                FROM rx_order_files
+                WHERE purged_at IS NULL AND uploaded_at < now() - make_interval(days => ${days})
+                  AND NOT (rx_file_id = ANY(${[...seen].map(Number)}::bigint[]))
+                ORDER BY uploaded_at
+                LIMIT ${BATCH}
+            `;
+            if (rows.length === 0) break;
+
+            const done: number[] = [];
+            const orders = new Set<string>();
+            for (const r of rows) {
+                seen.add(String(r.rx_file_id));
+                const path = resolve(String(r.stored_path));
+                /*
+                  ลบเฉพาะไฟล์ที่อยู่ในโฟลเดอร์เก็บใบสั่งยาเท่านั้น
+                  ค่าในฐานข้อมูลผิดหรือถูกแก้ ต้องไม่กลายเป็นการลบไฟล์อื่นของเครื่อง
+                  ไฟล์ที่อยู่นอกโฟลเดอร์ (เช่นเคยย้าย RX_UPLOAD_DIR) ข้ามไว้ ไม่ตั้งว่าลบแล้ว
+                */
+                if (!path.startsWith(UPLOAD_ROOT + sep)) { skipped += 1; continue; }
+                try {
+                    await unlink(path);
+                } catch (e) {
+                    if ((e as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+                        console.error('Purge rx file failed:', r.rx_file_id, e);
+                        skipped += 1;
+                        continue;
+                    }
+                }
+                done.push(Number(r.rx_file_id));
+                orders.add(String(r.rx_order_id));
+            }
+
+            if (done.length > 0) {
+                await nurse`UPDATE rx_order_files SET purged_at = now() WHERE rx_file_id = ANY(${done}::bigint[])`;
+                files += done.length;
+                /* ประวัติของใบบอกด้วยว่าไฟล์หายไปเพราะครบกำหนด ไม่ใช่มีคนลบ */
+                for (const orderId of orders) {
+                    await nurse`
+                        INSERT INTO rx_order_events (rx_order_id, action, actor, actor_name, detail)
+                        VALUES (${orderId}, 'purge_files', 'system', 'ระบบ (ครบกำหนดจัดเก็บ)',
+                                ${nurse.json({ retention_days: days })})
+                    `;
+                }
+            }
+            if (rows.length < BATCH) break;
+        }
+        lastRun = { at: new Date().toISOString(), files, skipped };
+        if (files > 0 || skipped > 0) {
+            console.log(`🗑️  rx retention: ลบไฟล์ครบกำหนด ${files} ไฟล์${skipped ? ` · ข้าม ${skipped}` : ''}`);
+        }
+        return lastRun;
+    } catch (error) {
+        console.error('Purge rx files error:', error);
+        return null;
+    } finally {
+        running = false;
+    }
+};
+
+/** เริ่มตัวลบอัตโนมัติ เรียกครั้งเดียวตอนเปิดเซิร์ฟเวอร์ */
+export const startRxRetention = () => {
+    /* รอให้เซิร์ฟเวอร์ตั้งตัวก่อน ไม่ไปแย่งฐานข้อมูลตอนที่ทุกหน้าจอกำลังเชื่อมต่อกลับเข้ามา */
+    setTimeout(() => { void purgeExpiredRxFiles(); }, 60_000);
+    setInterval(() => { void purgeExpiredRxFiles(); }, RUN_EVERY_MS);
+};
+
+/* ───────────────────────── API ───────────────────────── */
+
+/**
+ * ค่าตั้งปัจจุบัน ผู้ใช้ทุกคนอ่านได้ (หน้าจอใช้บอกว่าไฟล์เก็บกี่วัน)
+ * ส่ง ?days=N มาด้วย = ขอดูว่าถ้าตั้งเป็น N จะมีไฟล์ถูกลบกี่ไฟล์ ก่อนกดบันทึกจริง
+ */
+export const getRxRetention = async ({ query, user, set }: Context & { user?: unknown }) => {
+    try {
+        const days = await retentionDays();
+        const want = Number((query as { days?: string } | undefined)?.days);
+        const preview = Number.isInteger(want) && want >= RETENTION_MIN && want <= RETENTION_MAX ? want : days;
+        const row = await nurse`SELECT updated_at, updated_by FROM system_settings WHERE key = ${SETTING_KEY} LIMIT 1`;
+        return {
+            success: true,
+            data: {
+                days,
+                min: RETENTION_MIN,
+                max: RETENTION_MAX,
+                default: RETENTION_DEFAULT,
+                updated_at: row[0]?.updated_at ?? null,
+                updated_by: row[0]?.updated_by ?? null,
+                can_manage: await isAdmin(user),
+                preview_days: preview,
+                due: await countDue(preview),
+                last_run: lastRun,
+            },
+        };
+    } catch (error) {
+        console.error('Get rx retention error:', error);
+        set.status = 500;
+        return { success: false, message: 'อ่านค่าตั้งไม่สำเร็จ' };
+    }
+};
+
+export const setRxRetention = async ({ body, user, set }: Context & { user?: unknown }) => {
+    if (!(await isAdmin(user))) {
+        set.status = 403;
+        return { success: false, message: 'เฉพาะผู้ดูแลระบบเท่านั้นที่เปลี่ยนค่านี้ได้' };
+    }
+    const days = Number((body as { days?: unknown } | undefined)?.days);
+    if (!Number.isInteger(days) || days < RETENTION_MIN || days > RETENTION_MAX) {
+        set.status = 400;
+        return { success: false, message: `กรุณาระบุจำนวนวันเป็นตัวเลข ${RETENTION_MIN}-${RETENTION_MAX}` };
+    }
+    const username = String((user as { username?: unknown })?.username ?? '');
+    try {
+        await nurse`
+            INSERT INTO system_settings (key, value, description, updated_at, updated_by)
+            VALUES (${SETTING_KEY}, ${nurse.json({ days })},
+                    'จำนวนวันที่เก็บไฟล์ภาพใบสั่งยา ครบแล้วลบออกจากดิสก์', ${new Date()}, ${username})
+            ON CONFLICT (key) DO UPDATE
+            SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by
+        `;
+        return { success: true, message: `ตั้งเก็บไฟล์ ${days} วันแล้ว`, data: { days } };
+    } catch (error) {
+        console.error('Set rx retention error:', error);
+        set.status = 500;
+        return { success: false, message: 'บันทึกไม่สำเร็จ' };
+    }
+};

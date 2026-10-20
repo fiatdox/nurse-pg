@@ -5,6 +5,7 @@ import {
     ackRxOrder, completeRxOrder, prepareRxOrder, pickupRxOrder, closeRxOrder, rejectRxOrder,
 } from '../controllers/rxOrderController';
 import { readRxHn } from '../controllers/rxHnReaderController';
+import { getRxRetention, setRxRetention } from '../controllers/rxRetentionController';
 
 /**
  * ใบสั่งยาจากหอผู้ป่วยถึงห้องยา
@@ -85,7 +86,16 @@ export const rxOrderRoutes = new Elysia({ prefix: '/api/v1/rx' })
     })
 
     .get('/orders/:id/files/:fileId', getRxOrderFile, {
-        detail: { summary: 'เปิดดูไฟล์ใบสั่งยา (บันทึกลงประวัติทุกครั้งที่เปิด)' },
+        detail: { summary: 'เปิดดูไฟล์ใบสั่งยา (บันทึกลงประวัติทุกครั้งที่เปิด) · ไฟล์ที่ลบตามกำหนดแล้วได้ 410' },
+    })
+
+    .get('/retention', getRxRetention, {
+        query: t.Object({ days: t.Optional(t.String()) }),
+        detail: { summary: 'จำนวนวันที่เก็บไฟล์ใบสั่งยา และจำนวนไฟล์ที่จะถูกลบ (?days=N ดูล่วงหน้า)' },
+    })
+    .put('/retention', setRxRetention, {
+        body: t.Object({ days: t.Number() }),
+        detail: { summary: 'ตั้งจำนวนวันเก็บไฟล์ใบสั่งยา (เฉพาะผู้ดูแลระบบ)' },
     })
 
     .post('/orders/:id/ack', ackRxOrder, {
