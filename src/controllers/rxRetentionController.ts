@@ -2,7 +2,7 @@ import { Context } from 'elysia';
 import { join, resolve, sep } from 'path';
 import { unlink } from 'fs/promises';
 import { nurse } from '../db';
-import { isAdmin, readSetting } from './systemSettingsController';
+import { isAdmin } from './systemSettingsController';
 
 /**
  * ระยะเวลาจัดเก็บไฟล์ใบสั่งยา
@@ -12,7 +12,6 @@ import { isAdmin, readSetting } from './systemSettingsController';
  * (ใบสั่งยาตัวจริงอยู่ในแฟ้มผู้ป่วยและถูกคีย์ลง HIS แล้ว ภาพนี้เป็นสำเนาที่ใช้ส่งงานเท่านั้น)
  */
 
-const SETTING_KEY = 'rx_file_retention';
 export const RETENTION_DEFAULT = 120;
 
 /*
@@ -22,17 +21,34 @@ export const RETENTION_DEFAULT = 120;
 export const RETENTION_MIN = 30;
 export const RETENTION_MAX = 3650;
 
+/**
+ * จำนวนวันเก็บไฟล์ ตั้งใน .env ด้วย RX_FILE_RETENTION_DAYS (ไม่ตั้ง = 120)
+ *
+ * อ่านครั้งเดียวตอนเปิดเซิร์ฟเวอร์ เปลี่ยนค่าแล้วต้อง restart
+ * ค่าผิดรูปแบบหรือนอกช่วง ใช้ค่าเริ่มต้นแทนและเตือนใน log
+ * ไม่ใช้ค่าที่ผิดไปตรง ๆ เพราะพิมพ์ผิดเป็น 1 แปลว่าไฟล์ทั้งระบบหายในรอบถัดไป
+ * และการถอยไปใช้ 120 เป็นทางที่เก็บไฟล์ไว้นานขึ้น ไม่ใช่ลบเร็วขึ้น
+ */
+const RETENTION_DAYS = (() => {
+    const raw = (process.env.RX_FILE_RETENTION_DAYS ?? '').trim();
+    if (raw === '') return RETENTION_DEFAULT;
+    const d = Number(raw);
+    if (Number.isInteger(d) && d >= RETENTION_MIN && d <= RETENTION_MAX) return d;
+    console.warn(
+        `⚠️  RX_FILE_RETENTION_DAYS="${raw}" ใช้ไม่ได้ (ต้องเป็นจำนวนเต็ม ${RETENTION_MIN}-${RETENTION_MAX}) `
+        + `ใช้ค่าเริ่มต้น ${RETENTION_DEFAULT} วันแทน`,
+    );
+    return RETENTION_DEFAULT;
+})();
+
 /** ทุกกี่ชั่วโมงไปไล่ลบ ถี่กว่าวันละครั้งเพื่อให้รอบที่พลาดเพราะ restart ถูกชดเชยเร็ว */
 const RUN_EVERY_MS = 6 * 60 * 60 * 1000;
 const BATCH = 200;
 
 const UPLOAD_ROOT = resolve(process.env.RX_UPLOAD_DIR || join(process.cwd(), 'uploads', 'rx'));
 
-export const retentionDays = async (): Promise<number> => {
-    const v = await readSetting<{ days?: number }>(SETTING_KEY, { days: RETENTION_DEFAULT });
-    const d = Number(v?.days);
-    return Number.isInteger(d) && d >= RETENTION_MIN && d <= RETENTION_MAX ? d : RETENTION_DEFAULT;
-};
+/* async ไว้เหมือนเดิม ผู้เรียกไม่ต้องเปลี่ยน ถ้าวันหนึ่งย้ายกลับไปเก็บในฐานข้อมูล */
+export const retentionDays = async (): Promise<number> => RETENTION_DAYS;
 
 /** ไฟล์ที่ยังไม่ถูกลบและเก่ากว่ากำหนด = จะถูกลบในรอบถัดไป */
 const countDue = async (days: number) => {
@@ -134,15 +150,15 @@ export const startRxRetention = () => {
 /* ───────────────────────── API ───────────────────────── */
 
 /**
- * ค่าตั้งปัจจุบัน ผู้ใช้ทุกคนอ่านได้ (หน้าจอใช้บอกว่าไฟล์เก็บกี่วัน)
- * ส่ง ?days=N มาด้วย = ขอดูว่าถ้าตั้งเป็น N จะมีไฟล์ถูกลบกี่ไฟล์ ก่อนกดบันทึกจริง
+ * ค่าที่ใช้อยู่ ผู้ใช้ทุกคนอ่านได้ (หน้าจอใช้บอกว่าไฟล์เก็บกี่วัน)
+ * ส่ง ?days=N มาด้วย = ขอดูว่าถ้าตั้งเป็น N จะมีไฟล์ถูกลบกี่ไฟล์ ใช้ประกอบการตัดสินใจก่อนแก้ .env
+ * ค่าจริงเปลี่ยนจากหน้าจอไม่ได้ ต้องแก้ RX_FILE_RETENTION_DAYS แล้ว restart เซิร์ฟเวอร์
  */
 export const getRxRetention = async ({ query, user, set }: Context & { user?: unknown }) => {
     try {
         const days = await retentionDays();
         const want = Number((query as { days?: string } | undefined)?.days);
         const preview = Number.isInteger(want) && want >= RETENTION_MIN && want <= RETENTION_MAX ? want : days;
-        const row = await nurse`SELECT updated_at, updated_by FROM system_settings WHERE key = ${SETTING_KEY} LIMIT 1`;
         return {
             success: true,
             data: {
@@ -150,9 +166,9 @@ export const getRxRetention = async ({ query, user, set }: Context & { user?: un
                 min: RETENTION_MIN,
                 max: RETENTION_MAX,
                 default: RETENTION_DEFAULT,
-                updated_at: row[0]?.updated_at ?? null,
-                updated_by: row[0]?.updated_by ?? null,
-                can_manage: await isAdmin(user),
+                source: 'env' as const,
+                env_key: 'RX_FILE_RETENTION_DAYS',
+                is_admin: await isAdmin(user),
                 preview_days: preview,
                 due: await countDue(preview),
                 last_run: lastRun,
@@ -162,32 +178,5 @@ export const getRxRetention = async ({ query, user, set }: Context & { user?: un
         console.error('Get rx retention error:', error);
         set.status = 500;
         return { success: false, message: 'อ่านค่าตั้งไม่สำเร็จ' };
-    }
-};
-
-export const setRxRetention = async ({ body, user, set }: Context & { user?: unknown }) => {
-    if (!(await isAdmin(user))) {
-        set.status = 403;
-        return { success: false, message: 'เฉพาะผู้ดูแลระบบเท่านั้นที่เปลี่ยนค่านี้ได้' };
-    }
-    const days = Number((body as { days?: unknown } | undefined)?.days);
-    if (!Number.isInteger(days) || days < RETENTION_MIN || days > RETENTION_MAX) {
-        set.status = 400;
-        return { success: false, message: `กรุณาระบุจำนวนวันเป็นตัวเลข ${RETENTION_MIN}-${RETENTION_MAX}` };
-    }
-    const username = String((user as { username?: unknown })?.username ?? '');
-    try {
-        await nurse`
-            INSERT INTO system_settings (key, value, description, updated_at, updated_by)
-            VALUES (${SETTING_KEY}, ${nurse.json({ days })},
-                    'จำนวนวันที่เก็บไฟล์ภาพใบสั่งยา ครบแล้วลบออกจากดิสก์', ${new Date()}, ${username})
-            ON CONFLICT (key) DO UPDATE
-            SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by
-        `;
-        return { success: true, message: `ตั้งเก็บไฟล์ ${days} วันแล้ว`, data: { days } };
-    } catch (error) {
-        console.error('Set rx retention error:', error);
-        set.status = 500;
-        return { success: false, message: 'บันทึกไม่สำเร็จ' };
     }
 };
