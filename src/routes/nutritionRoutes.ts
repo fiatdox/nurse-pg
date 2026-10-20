@@ -13,13 +13,21 @@ import {
     getFoodTypeDashboard,
     getTrayLabels,
     getDailyFoodSummary,
-    receiveFoodOrders
+    getDailyTypeSummary,
+    receiveFoodOrders,
+    approveFoodOrders
 } from '../controllers/nutritionController';
 import {
     listFoodItems,
     createFoodItems,
     setFoodItemActive
 } from '../controllers/foodItemController';
+import {
+    getFoodTypePrices,
+    setFoodTypePrice,
+    deleteFoodTypePrice
+} from '../controllers/foodPriceController';
+import { getFoodPaymentSummary, getFoodPivotData } from '../controllers/foodPaymentController';
 
 export const nutritionRoutes = new Elysia({ prefix: '/api/v1/nutrition' })
     .use(authMiddleware)
@@ -83,6 +91,10 @@ export const nutritionRoutes = new Elysia({ prefix: '/api/v1/nutrition' })
         body: t.Object({ date: t.String() }),
         detail: { summary: 'สรุปรายการอาหารประจำวัน แยกตามมื้อ หอผู้ป่วย และเมนู' }
     })
+    .post('/daily-type-summary', getDailyTypeSummary, {
+        body: t.Object({ date: t.String() }),
+        detail: { summary: 'สรุปยอดการสั่งอาหารประจำวัน แยกตามหอผู้ป่วย มื้อ และประเภทห้อง (สามัญ / พิเศษ / VIP)' }
+    })
     .post('/food-type-dashboard', getFoodTypeDashboard, {
         body: t.Object({ date1: t.String(), date2: t.String() }),
         detail: { summary: 'สรุปยอดอาหารตามประเภทห้อง ชนิดอาหาร มื้อ วัน และหอผู้ป่วย สำหรับแดชบอร์ดงานโภชนาการ' }
@@ -94,6 +106,15 @@ export const nutritionRoutes = new Elysia({ prefix: '/api/v1/nutrition' })
             ward: t.Optional(t.Union([t.String(), t.Null()]))
         }),
         detail: { summary: 'รายการสำหรับพิมพ์ฉลากติดถาดอาหาร เรียงตามหอผู้ป่วยและเตียง' }
+    })
+    .post('/approve-orders', approveFoodOrders, {
+        body: t.Object({
+            ward: t.String(),
+            date: t.String(),
+            meal: t.Number(),
+            undo: t.Optional(t.Boolean())
+        }),
+        detail: { summary: 'อนุมัติรายการอาหารให้ส่งต่อบริษัทผู้รับจ้าง รายหอต่อมื้อ (undo = ถอนการอนุมัติ)' }
     })
     .post('/receive-orders', receiveFoodOrders, {
         body: t.Object({
@@ -113,6 +134,35 @@ export const nutritionRoutes = new Elysia({ prefix: '/api/v1/nutrition' })
             classes: t.Array(t.String(), { minItems: 1 })
         }),
         detail: { summary: 'เพิ่มเมนูอาหาร สร้างหนึ่งแถวต่อหนึ่งประเภทห้องที่เลือก (สามัญ / พิเศษ / VIP)' }
+    })
+    .post('/food-payment', getFoodPaymentSummary, {
+        body: t.Object({ date1: t.String(), date2: t.String() }),
+        detail: { summary: 'ยอดเงินที่ต้องจ่ายบริษัทผู้รับจ้างทำอาหาร ตามช่วงวันที่และราคาตามสัญญา' }
+    })
+    .post('/food-pivot', getFoodPivotData, {
+        body: t.Object({ date1: t.String(), date2: t.String() }),
+        detail: { summary: 'ข้อมูลดิบสำหรับตารางไขว้ หอผู้ป่วย × มื้อ × ประเภท × วัน (นับเป็นจำนวนมื้อ)' }
+    })
+    .post('/food-type-prices', getFoodTypePrices, {
+        body: t.Optional(t.Object({ as_of: t.Optional(t.String()) })),
+        detail: { summary: 'ราคาอาหารตามประเภทห้อง ณ วันที่อ้างอิง พร้อมประวัติราคาทั้งหมด' }
+    })
+    .put('/food-type-prices', setFoodTypePrice, {
+        body: t.Object({
+            food_type_price_id: t.Optional(t.Union([t.Number(), t.Null()])),
+            food_type_id: t.Number(),
+            price_per_day: t.Number(),
+            effective_from: t.String(),
+            effective_to: t.Optional(t.Union([t.String(), t.Null()])),
+            meals_per_day: t.Optional(t.Number()),
+            contract_note: t.Optional(t.Union([t.String(), t.Null()])),
+            vendor_id: t.Optional(t.Union([t.Number(), t.Null()]))
+        }),
+        detail: { summary: 'เพิ่มหรือแก้ไขสัญญาราคาอาหาร ส่ง food_type_price_id = แก้ไขฉบับนั้น (เฉพาะผู้ดูแลระบบ)' }
+    })
+    .delete('/food-type-prices', deleteFoodTypePrice, {
+        body: t.Object({ food_type_price_id: t.Number() }),
+        detail: { summary: 'ลบรายการราคาออกจากประวัติ ใช้แก้กรณีบันทึกผิด (เฉพาะผู้ดูแลระบบ)' }
     })
     .patch('/food-items/active', setFoodItemActive, {
         body: t.Object({

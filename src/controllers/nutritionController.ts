@@ -475,7 +475,13 @@ export const getDailyFoodSummary = async ({ body, set }: { body: { date: string 
             ORDER BY fo.meal, fo.ward, al.bedno
         `;
 
-        // สถานะการรับรายหอ×มื้อ — ใช้เวลาที่รับล่าสุดเป็นตัวแทนของทั้งชุด
+        /*
+          สถานะรายหอ×มื้อ — ใช้เวลาล่าสุดเป็นตัวแทนของทั้งชุด
+
+          มีสองขั้นที่ต้องดูคู่กัน อนุมัติ (ส่งให้บริษัท) กับ รับมอบ (ตั้งต้นการจ่ายเงิน)
+          นับที่ยังไม่อนุมัติแยกไว้ด้วย เพราะรายการที่หอสั่งเพิ่มหลังอนุมัติไปแล้ว
+          จะค้างอยู่โดยที่บริษัทมองไม่เห็น ต้องมีอะไรบอกให้กดอนุมัติซ้ำ
+        */
         const status = await nurse`
             SELECT
                  fo.meal
@@ -485,6 +491,9 @@ export const getDailyFoodSummary = async ({ body, set }: { body: { date: string 
                 ,COUNT(*) FILTER (WHERE fo.recieve_order_status = 'Y')::int AS received
                 ,MAX(fo.reciever_name) FILTER (WHERE fo.recieve_order_status = 'Y') AS reciever_name
                 ,TO_CHAR(MAX(fo.recieve_order_datetime), 'DD/MM/YYYY HH24:MI') AS received_at
+                ,COUNT(*) FILTER (WHERE fo.approved_at IS NOT NULL)::int AS approved
+                ,MAX(fo.approved_by_name) FILTER (WHERE fo.approved_at IS NOT NULL) AS approved_by_name
+                ,TO_CHAR(MAX(fo.approved_at), 'DD/MM/YYYY HH24:MI') AS approved_at
             FROM food_orders fo
             LEFT JOIN ward w ON w.his_code = fo.ward
             WHERE fo.order_date = ${date}
@@ -508,12 +517,109 @@ export const getDailyFoodSummary = async ({ body, set }: { body: { date: string 
                     ...r,
                     ward_name: sanitizeHTML(r.ward_name),
                     reciever_name: sanitizeHTML(r.reciever_name),
+                    approved_by_name: sanitizeHTML(r.approved_by_name),
                     pending: r.total - r.received,
+                    // รายการที่หอสั่งเพิ่มหลังกดอนุมัติไปแล้ว บริษัทยังมองไม่เห็นจนกว่าจะกดซ้ำ
+                    unapproved: r.total - r.approved,
                 })),
             },
         };
     } catch (error) {
         console.error('Get daily food summary error:', error);
+        set.status = 500;
+        return { success: false, message: 'Internal Server Error' };
+    }
+};
+
+/**
+ * สรุปยอดการสั่งอาหารประจำวัน แยกตามหอผู้ป่วย มื้อ และประเภทห้อง
+ *
+ * ต่างจาก getDailyFoodSummary ที่แตกถึงระดับเมนู ใบนี้ยุบเหลือแค่จำนวนที่ต่อประเภท
+ * เพราะครัวใช้ตอนคิดต้นทุนและจัดสรรวัตถุดิบ ซึ่งดูที่ประเภทห้อง ไม่ได้ดูว่าเมนูอะไร
+ *
+ * ส่งครบทั้งสามมื้อของทุกหอที่มีการสั่งในวันนั้น แม้มื้อที่ยอดเป็นศูนย์
+ * เพราะช่องว่างคือข้อมูล — หอที่ไม่มียอดมื้อเย็นอาจแปลว่าลืมสั่ง ไม่ใช่ไม่ต้องการ
+ */
+export const getDailyTypeSummary = async ({ body, set }: { body: { date: string }, set: any }) => {
+    const date = String(body?.date ?? '').trim();
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+        set.status = 400;
+        return { success: false, message: 'กรุณาระบุวันที่ในรูปแบบ YYYY-MM-DD' };
+    }
+
+    interface TypeSummaryRow {
+        ward: string;
+        ward_name: string;
+        meal: number;
+        meal_name: string;
+        normal: number;
+        special: number;
+        vip: number;
+        npo: number;
+        unspecified: number;
+        total: number;
+    }
+
+    try {
+        const rows = await nurse<TypeSummaryRow[]>`
+            WITH src AS (
+                SELECT fo.ward, fo.meal, fi.food_type_id
+                FROM food_orders fo
+                LEFT JOIN food_items fi ON fi.food_item_id = fo.food_item_id
+                WHERE fo.order_date = ${date}
+                  AND fo.cancelled_at IS NULL
+            ), wards AS (
+                SELECT DISTINCT ward FROM src
+            )
+            SELECT
+                 wd.ward
+                ,COALESCE(w.ward_name, 'ไม่ระบุหอผู้ป่วย')                        AS ward_name
+                ,m.meal
+                ,m.name                                                          AS meal_name
+                ,COUNT(*) FILTER (WHERE s.food_type_id = 1)::int                  AS normal
+                ,COUNT(*) FILTER (WHERE s.food_type_id = 2)::int                  AS special
+                ,COUNT(*) FILTER (WHERE s.food_type_id = 3)::int                  AS vip
+                ,COUNT(*) FILTER (WHERE s.food_type_id = 9)::int                  AS npo
+                /*
+                  เมนูที่ยังไม่ได้ระบุประเภท ต้องมีช่องของตัวเอง ไม่ใช่ถูกกลืนหายไป
+                  ไม่งั้นผลรวมของสามช่องจะไม่เท่ายอดจริง แล้วครัวจะเตรียมของขาด
+                  โดยไม่มีอะไรบอกว่าขาดตรงไหน
+                */
+                ,COUNT(*) FILTER (WHERE s.ward IS NOT NULL AND s.food_type_id IS NULL)::int AS unspecified
+                ,COUNT(*) FILTER (WHERE s.ward IS NOT NULL)::int                  AS total
+            FROM wards wd
+            -- ทุกหอต้องมีครบสามมื้อ มื้อที่ไม่มีคนสั่งจะได้เห็นเป็นศูนย์ ไม่ใช่หายไปทั้งแถว
+            CROSS JOIN meal m
+            LEFT JOIN src s   ON s.ward = wd.ward AND s.meal = m.meal
+            LEFT JOIN ward w  ON w.his_code = wd.ward
+            GROUP BY wd.ward, w.ward_name, m.meal, m.name
+            ORDER BY ward_name, m.meal
+        `;
+
+        const data = rows.map(r => ({ ...r, ward_name: sanitizeHTML(r.ward_name), meal_name: sanitizeHTML(r.meal_name) }));
+
+        const sum = (k: 'normal' | 'special' | 'vip' | 'npo' | 'unspecified' | 'total') =>
+            data.reduce((s, r) => s + Number(r[k]), 0);
+
+        return {
+            success: true,
+            data: {
+                date,
+                rows: data,
+                summary: {
+                    wards: new Set(data.map(r => r.ward)).size,
+                    normal: sum('normal'),
+                    special: sum('special'),
+                    vip: sum('vip'),
+                    npo: sum('npo'),
+                    unspecified: sum('unspecified'),
+                    total: sum('total'),
+                },
+            },
+        };
+    } catch (error) {
+        console.error('Get daily type summary error:', error);
         set.status = 500;
         return { success: false, message: 'Internal Server Error' };
     }
@@ -575,6 +681,94 @@ export const receiveFoodOrders = async (
         };
     } catch (error) {
         console.error('Receive food orders error:', error);
+        set.status = 500;
+        return { success: false, message: 'Internal Server Error' };
+    }
+};
+
+/**
+ * อนุมัติรายการอาหารให้ส่งต่อไปยังบริษัทผู้รับจ้าง
+ *
+ * บริษัทเห็นเฉพาะรายการที่ผ่านขั้นตอนนี้แล้ว ต่างจากงานโภชนาการที่เห็นทุกรายการ
+ * ตั้งแต่หอผู้ป่วยสั่งเข้ามา เพราะรายการดิบยังแก้ไขได้จนถึงเวลาปิดยอด
+ * ถ้าให้บริษัทเห็นทันที บริษัทจะตั้งหม้อตามยอดที่ยังไม่นิ่ง
+ *
+ * ทำทีละ หอ x วัน x มื้อ แบบเดียวกับการรับยอด เพื่อให้คนทำงานใช้จังหวะเดียวกันทั้งสองปุ่ม
+ * และถอนคืนได้ด้วย undo เพราะอนุมัติผิดมื้อเป็นเรื่องที่เกิดได้
+ *
+ * รายการที่หอสั่งเพิ่มหลังอนุมัติจะยังไม่อนุมัติ ต้องกดซ้ำ
+ * ตั้งใจให้เป็นแบบนี้ ไม่งั้นใบที่บริษัทพิมพ์ไปแล้วจะไม่ตรงกับยอดในระบบโดยไม่มีใครรู้
+ */
+export const approveFoodOrders = async (
+    { body, set, user }: { body: { ward: string, date: string, meal: number, undo?: boolean }, set: any, user?: unknown }
+) => {
+    const { ward, date, meal, undo } = body ?? {};
+
+    if (!ward || !/^\d{4}-\d{2}-\d{2}$/.test(String(date ?? '')) || ![1, 2, 3].includes(Number(meal))) {
+        set.status = 400;
+        return { success: false, message: 'กรุณาระบุ ward, date (YYYY-MM-DD) และ meal (1-3) ให้ถูกต้อง' };
+    }
+
+    const { ok, actor } = await isNutritionStaff(user);
+    if (!ok) {
+        set.status = 403;
+        return { success: false, message: 'เฉพาะเจ้าหน้าที่งานโภชนาการเท่านั้นที่อนุมัติรายการอาหารได้' };
+    }
+
+    try {
+        const actorId = actor?.userId ? Number(actor.userId) : null;
+
+        /*
+          ถอนการอนุมัติไม่ได้ถ้ารับมอบของไปแล้ว
+
+          รับมอบแปลว่าบริษัททำและส่งของมาแล้ว การถอนอนุมัติตอนนั้นจะทำให้
+          รายการหายไปจากใบงานของบริษัทย้อนหลัง ทั้งที่ของมาถึงแล้วและต้องจ่ายเงิน
+        */
+        if (undo) {
+            const received = await nurse`
+                SELECT COUNT(*)::int AS n FROM food_orders
+                WHERE ward = ${ward} AND order_date = ${date} AND meal = ${Number(meal)}
+                  AND cancelled_at IS NULL AND recieve_order_status = 'Y'`;
+            if (Number(received[0]?.n ?? 0) > 0) {
+                set.status = 409;
+                return {
+                    success: false,
+                    message: `ถอนการอนุมัติไม่ได้ เพราะรับมอบไปแล้ว ${received[0].n} รายการ — ถอนการรับก่อน`,
+                };
+            }
+        }
+
+        const result = undo
+            ? await nurse`
+                UPDATE food_orders
+                SET approved_at = NULL, approved_by = NULL, approved_by_name = NULL
+                WHERE ward = ${ward} AND order_date = ${date} AND meal = ${Number(meal)}
+                  AND cancelled_at IS NULL AND approved_at IS NOT NULL
+                RETURNING food_order_id`
+            : await nurse`
+                UPDATE food_orders
+                SET approved_at = NOW(), approved_by = ${actorId}, approved_by_name = ${actor?.fullname ?? null}
+                WHERE ward = ${ward} AND order_date = ${date} AND meal = ${Number(meal)}
+                  AND cancelled_at IS NULL AND approved_at IS NULL
+                RETURNING food_order_id`;
+
+        if (result.length === 0) {
+            set.status = 404;
+            return {
+                success: false,
+                message: undo
+                    ? 'ไม่พบรายการที่อนุมัติไว้ของหอผู้ป่วยและมื้อนี้'
+                    : 'ไม่พบรายการที่ยังไม่ได้อนุมัติของหอผู้ป่วยและมื้อนี้',
+            };
+        }
+
+        return {
+            success: true,
+            message: `${undo ? 'ถอนการอนุมัติ' : 'อนุมัติ'}รายการอาหารเรียบร้อยแล้ว จำนวน ${result.length} รายการ`,
+            data: { affected: result.length },
+        };
+    } catch (error) {
+        console.error('Approve food orders error:', error);
         set.status = 500;
         return { success: false, message: 'Internal Server Error' };
     }

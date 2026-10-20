@@ -20,6 +20,15 @@ const FOOD_CLASSES = ['สามัญ', 'พิเศษ', 'VIP'] as const;
 type FoodClass = typeof FOOD_CLASSES[number];
 
 /**
+ * รหัสประเภท "งดอาหาร (NPO)"
+ *
+ * ไม่ใช่ประเภทห้อง แต่เป็นสถานะว่าผู้ป่วยงดอาหาร ยังต้องสั่งไว้ในระบบ
+ * เพื่อให้ครัวและหอผู้ป่วยรู้ว่าเตียงนี้งด ไม่ใช่ลืมสั่ง
+ * แต่ไม่มีอาหารส่งจริง จึงไม่นำไปคิดเงินให้บริษัท
+ */
+export const NPO_FOOD_TYPE_ID = 9;
+
+/**
  * รหัสประเภทของชื่อที่ผู้ใช้ติ๊ก
  *
  * อ่านจากตารางทุกครั้งแทนการฝังรหัสไว้ในโค้ด เพราะถ้าวันหนึ่งมีคนแก้ชื่อประเภท
@@ -48,10 +57,7 @@ export const listFoodItems = async ({ set, user }: { set: any, user?: unknown })
     }
 
     try {
-        /*
-          นับยอดการสั่งมาด้วย เพราะคนใช้ต้องรู้ก่อนกดปิดเมนูว่ามีคนสั่งอยู่จริงไหม
-          และเป็นเหตุผลว่าทำไมถึงไม่มีปุ่มลบ — food_orders ย้อนหลังอ้างถึง food_item_id นี้อยู่
-        */
+        // อ่านเฉพาะทะเบียนเมนู ไม่แตะ food_orders เพราะหน้านี้มีไว้เพิ่มเมนู ไม่ใช่ดูยอด
         const rows = await nurse`
             SELECT
                  fi.food_item_id
@@ -63,15 +69,8 @@ export const listFoodItems = async ({ set, user }: { set: any, user?: unknown })
                 ,fi.created_by_name
                 ,fi.updated_at
                 ,fi.updated_by_name
-                ,COALESCE(u.order_count, 0)::int AS order_count
             FROM food_items fi
             LEFT JOIN food_types ft ON ft.food_type_id = fi.food_type_id
-            LEFT JOIN (
-                SELECT food_item_id, count(*)::int AS order_count
-                FROM food_orders
-                WHERE cancelled_at IS NULL
-                GROUP BY food_item_id
-            ) u ON u.food_item_id = fi.food_item_id
             ORDER BY fi.food_name`;
 
         return {
@@ -171,9 +170,15 @@ export const createFoodItems = async (
             created_by_name: actor?.fullname ?? null,
         }));
 
-        const inserted = await nurse<{ food_item_id: number, food_name: string, food_type_id: number }[]>`
+        /*
+          ไม่ระบุ generic ให้ nurse ตรงนี้ เพราะตัวช่วยสร้าง INSERT หลายแถวของ postgres.js
+          จะขัดกับ generic ที่ระบุไว้ แล้วทำให้ตรวจชนิดไม่ผ่านทั้งที่คิวรีถูกต้อง
+          จึงกำหนดชนิดของผลลัพธ์ตอนรับค่าแทน
+        */
+        const inserted = await nurse`
             INSERT INTO food_items ${nurse(values, 'food_name', 'food_type_id', 'is_active', 'created_at', 'created_by', 'created_by_name')}
-            RETURNING food_item_id, food_name, food_type_id`;
+            RETURNING food_item_id, food_name, food_type_id
+        ` as unknown as { food_item_id: number, food_name: string, food_type_id: number }[];
 
         return {
             success: true,

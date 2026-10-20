@@ -20,23 +20,33 @@ export const getPatientsByWard = async ({ body, set }: Context) => {
             const placeholders = registeredAns.map(() => '?').join(',');
             [rows] = await his.execute<RowDataPacket[]>(
                 `SELECT i.an, i.hn, i.dchstts, CONCAT(p.pname, p.fname, ' ', p.lname) AS ptname,
-                concat(i.regdate,' ',i.regtime) AS regdate, p.birthday, p.sex, a.bedno, d.name AS doctor_name, i.ward
+                concat(i.regdate,' ',i.regtime) AS regdate, p.birthday, p.sex, a.bedno, d.name AS doctor_name, i.ward,
+                i.spclty AS his_spclty, sp.name AS his_spclty_name
                 FROM ipt i
                 LEFT JOIN patient p ON p.hn = i.hn
                 LEFT JOIN iptadm a ON a.an = i.an
                 LEFT JOIN doctor d ON d.code = i.incharge_doctor
+                LEFT JOIN spclty sp ON sp.spclty = i.spclty
                 WHERE i.dchstts IS NULL AND i.ward = ? AND i.an NOT IN (${placeholders})
                 ORDER BY a.bedno ASC`,
                 [ward, ...registeredAns]
             );
         } else {
             [rows] = await his.execute<RowDataPacket[]>(
+                /*
+                  ดึง spclty ที่ HIS บันทึกไว้มาด้วย หน้าลงทะเบียนจะได้เลือกให้ล่วงหน้า
+                  ไม่ต้องให้พยาบาลเดาเองแล้วได้แผนกไม่ตรงกับที่แพทย์ลงไว้ในระบบหลัก
+                  เอาชื่อแผนกมาด้วย เผื่อกรณีที่ยังไม่มีรหัสนั้นในรายการของระบบพยาบาล
+                  จะได้บอกบนจอว่า HIS ระบุว่าแผนกอะไร ไม่ใช่ปล่อยช่องว่างเฉย ๆ
+                */
                 `SELECT i.an, i.hn, i.dchstts, CONCAT(p.pname, p.fname, ' ', p.lname) AS ptname,
-                concat(i.regdate,' ',i.regtime) AS regdate, p.birthday, p.sex, a.bedno, d.name AS doctor_name, i.ward
+                concat(i.regdate,' ',i.regtime) AS regdate, p.birthday, p.sex, a.bedno, d.name AS doctor_name, i.ward,
+                i.spclty AS his_spclty, sp.name AS his_spclty_name
                 FROM ipt i
                 LEFT JOIN patient p ON p.hn = i.hn
                 LEFT JOIN iptadm a ON a.an = i.an
                 LEFT JOIN doctor d ON d.code = i.incharge_doctor
+                LEFT JOIN spclty sp ON sp.spclty = i.spclty
                 WHERE i.dchstts IS NULL AND i.ward = ?
                 ORDER BY a.bedno ASC`,
                 [ward]
@@ -48,6 +58,7 @@ export const getPatientsByWard = async ({ body, set }: Context) => {
             data: rows.map(row => ({
                 ...row,
                 ptname: sanitizeHTML(row.ptname),
+                his_spclty_name: row.his_spclty_name ? sanitizeHTML(row.his_spclty_name) : null,
                 gender: row.sex ?? null,
             }))
         };
