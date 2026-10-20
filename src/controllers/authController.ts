@@ -1,5 +1,6 @@
 import { Context } from 'elysia';
 import {  core_kon } from '../db';
+import { STAFF_TOKEN } from '../middlewares/authMiddleware';
 
 export const loginCOREKON = async ({ body, set, jwt }: Context & { jwt: any }) => {
     const { username, password } = body as { username: string; password: string };
@@ -27,7 +28,8 @@ export const loginCOREKON = async ({ body, set, jwt }: Context & { jwt: any }) =
             return { success: false, message: 'Invalid username or password' };
         }
 
-        const token = await jwt.sign({ username: user.username });
+        // ประทับชนิดไว้ใน token เพื่อให้แยกออกจาก token ของบริษัทผู้รับจ้างได้ ดู authMiddleware
+        const token = await jwt.sign({ username: user.username, typ: STAFF_TOKEN });
         const weak = password === user.id_card;
 
         return {

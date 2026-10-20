@@ -28,7 +28,15 @@ export const getWardsV1 = async ({ set }: Context) => {
 
 export const getSpclty = async ({ set }: Context) => {
     try {
-        const rows = await nurse`SELECT spclty, name FROM spclty WHERE is_active = 'Y' ORDER BY name DESC`;
+        /*
+          ส่ง code ออกไปด้วย เพราะเป็นรหัสเดียวกับ ipt.spclty ของ HIS
+          หน้าลงทะเบียนใช้ตัวนี้แปลงค่าที่ HIS บันทึกไว้ กลับมาเป็นตัวเลือกในรายการ
+          ถ้าไม่ส่ง หน้าจอจะเทียบกับอะไรไม่ได้เลย เพราะรหัสสองฝั่งคนละชุดกัน
+          (ฝั่งนี้ 1-12 ฝั่ง HIS เป็น 01-43 และรหัสที่เลขชนกันคนละแผนกกัน)
+
+          เรียงจากน้อยไปมาก ของเดิมเป็น DESC ทำให้รายการไล่จาก อ ย้อนขึ้นไป ก
+        */
+        const rows = await nurse`SELECT spclty, code, name FROM spclty WHERE is_active = 'Y' ORDER BY name ASC`;
         return {
             success: true,
             // ป้องกันการโจมตีแบบ XSS โดยการลบแท็ก HTML ออกจากชื่อหอผู้ป่วย

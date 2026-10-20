@@ -360,7 +360,27 @@ export const getResultInFiscalYear = async ({ set }: Context) => {
 };
 
 // ฟังก์ชันสำหรับดึงประวัติผู้ป่วยนอก (OPD) ติดเชื้อดื้อยา
-export const getOpdPatientHistoryDaily = async ({ set }: Context) => {
+/**
+ * วันที่ของเครื่องเซิร์ฟเวอร์ในรูปแบบ YYYY-MM-DD
+ *
+ * ประกอบเองทีละส่วน ไม่ใช้ toISOString() เพราะตัวนั้นคืนเวลา UTC
+ * ไทยเร็วกว่า UTC เจ็ดชั่วโมง ช่วงเที่ยงคืนถึงเจ็ดโมงเช้าจึงได้วันที่ของเมื่อวาน
+ * ซึ่งเป็นช่วงเวรดึกพอดี คนที่เปิดหน้านี้ตอนตีสามจะเห็นข้อมูลผิดวันโดยไม่รู้ตัว
+ */
+const todayLocal = (): string => {
+    const d = new Date();
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
+
+export const getOpdPatientHistoryDaily = async ({ query, set }: Context) => {
+    const date = String((query as { date?: string } | undefined)?.date ?? '') || todayLocal();
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+        set.status = 400;
+        return { success: false, message: 'กรุณาระบุวันที่ในรูปแบบ YYYY-MM-DD' };
+    }
+
     try {
         const sql = `
             SELECT * FROM (
@@ -395,17 +415,19 @@ export const getOpdPatientHistoryDaily = async ({ set }: Context) => {
                 LEFT JOIN patient b ON b.hn = a.hn
                 LEFT JOIN kskdepartment c ON c.depcode = a.main_dep
                 LEFT JOIN spclty d ON d.spclty = a.spclty
-                WHERE a.vstdate = CURDATE()
+                -- รับวันที่มาเป็นพารามิเตอร์ ไม่ต่อสตริงเข้าไปในคิวรี
+                WHERE a.vstdate = ?
                 AND a.hn IN (SELECT t.HN FROM t_interface_result_bacteria t WHERE t.ConfirmDate >= DATE_ADD(a.vstdate, INTERVAL -90 DAY) AND t.hn = a.hn)
                 ORDER BY a.vstdate, a.main_dep ASC
             ) AS x 
             WHERE (x.cre <> '' OR x.vre <> '' OR x.mrsa <> '' OR x.escr <> '' OR x.mdr <> '')
         `;
 
-        const [rows] = await his.execute<RowDataPacket[]>(sql);
+        const [rows] = await his.execute<RowDataPacket[]>(sql, [date]);
 
         return {
             success: true,
+            date,
             data: rows.map(row => ({
                 ...row,
                 ptname: sanitizeHTML(row.ptname),
@@ -687,6 +709,165 @@ export const getMdroSankeyFiscalYear = async ({ set }: Context) => {
         };
     } catch (error) {
         console.error('Get MDRO sankey fiscal year error:', error);
+        set.status = 500;
+        return { success: false, message: 'Internal Server Error' };
+    }
+};
+
+/** ช่วงเฝ้าระวังผู้ป่วยนอกที่เคยตรวจพบเชื้อดื้อยา นับจากวันที่ยืนยันผลเพาะเชื้อ */
+const SURVEILLANCE_DAYS = 90;
+
+/** รหัสสถานะนัดหมายของ HOSxP ที่แปลว่ายกเลิกไปแล้ว */
+const APP_STATUS_CANCELLED = 4;
+
+/**
+ * ผู้ป่วยนอกที่มีนัดในวันที่เลือก และยังอยู่ในช่วงเฝ้าระวังเชื้อดื้อยา 90 วัน
+ *
+ * ต่างจากหน้า OPD Daily ที่อ่านจาก ovst ซึ่งมีข้อมูลก็ต่อเมื่อผู้ป่วยมาถึงแล้ว
+ * หน้านี้อ่านจากตารางนัด จึงเลือกวันข้างหน้าได้ งาน IC เอาไปเตรียมห้องแยก
+ * และอุปกรณ์ล่วงหน้าได้ก่อนถึงวันจริง
+ *
+ * ข้อจำกัดที่ต้องรู้: คนที่ walk-in โดยไม่มีนัดจะไม่อยู่ในรายการนี้
+ * หน้านี้จึงใช้แทน OPD Daily ไม่ได้ ใช้คู่กัน
+ *
+ * หนึ่งแถวคือหนึ่งนัด ไม่ใช่หนึ่งคน ผู้ป่วยที่มีนัดสองคลินิกในวันเดียวกัน
+ * จะขึ้นสองแถว เพราะทั้งสองคลินิกต้องรู้ว่าต้องเตรียมรับ
+ */
+export const getOpdInfectionFollowup = async (
+    { body, set }: { body: { date: string }, set: any }
+) => {
+    const { date } = body ?? {};
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date ?? ''))) {
+        set.status = 400;
+        return { success: false, message: 'กรุณาระบุวันที่ในรูปแบบ YYYY-MM-DD' };
+    }
+
+    try {
+        const sql = `
+            WITH app AS (
+                SELECT o.oapp_id, o.hn, o.nextdate, o.nexttime, o.depcode, o.spclty, o.app_cause, o.oapp_status_id
+                FROM oapp o
+                WHERE o.nextdate = ?
+                  -- สถานะว่างคือนัดเก่าที่ยังไม่เคยถูกแตะ ไม่ใช่นัดที่ถูกยกเลิก
+                  AND (o.oapp_status_id IS NULL OR o.oapp_status_id <> ${APP_STATUS_CANCELLED})
+            ), inf AS (
+                /*
+                  ผลเพาะเชื้อที่ยังอยู่ในช่วงเฝ้าระวัง ณ วันนัด
+                  เอาเฉพาะใบล่าสุดของแต่ละคนมาแสดง (rn = 1) แต่ยังนับจำนวนใบทั้งหมดไว้
+                  เพราะคนที่พบเชื้อซ้ำหลายครั้งมีความเสี่ยงต่างจากคนที่พบครั้งเดียว
+
+                  กรองด้วย HN ของคนที่มีนัดก่อน เพื่อให้ใช้ idx_hn ได้
+                  ตาราง t_interface_result_bacteria ไม่มีดัชนีที่ ConfirmDate
+                  ถ้ากรองด้วยช่วงวันอย่างเดียวจะต้องอ่านทั้งตาราง 627,118 แถว
+
+                  แปลงชุดอักขระที่ฝั่งตารางนัดซึ่งไม่มีดัชนีในคิวรีนี้ ไม่ใช่ฝั่ง b.HN ที่มีดัชนี
+                  ถ้าแปลงผิดฝั่ง ดัชนีจะใช้ไม่ได้ทันที
+                */
+                SELECT
+                     CONVERT(b.HN USING tis620) AS hn
+                    ,b.ConfirmDate
+                    ,b.Hospital_LabNumber
+                    ,b.Specimen
+                    ,b.ResultValue
+                    ,ROW_NUMBER() OVER (PARTITION BY b.HN ORDER BY b.ConfirmDate DESC, b.InterfaceResultID DESC) AS rn
+                    ,COUNT(*)    OVER (PARTITION BY b.HN) AS result_count
+                FROM t_interface_result_bacteria b
+                WHERE b.ResultName  LIKE 'or%'
+                  AND b.ResultValue LIKE '%(%)%'
+                  AND b.ConfirmDate >= DATE_SUB(?, INTERVAL ${SURVEILLANCE_DAYS} DAY)
+                  -- ไม่เอาผลที่ยืนยันหลังวันนัด เวลาเลือกวันย้อนหลังจะได้เห็นภาพเท่าที่รู้ ณ วันนั้น
+                  AND b.ConfirmDate <= ?
+                  AND b.HN IN (SELECT CONVERT(a2.hn USING utf8mb3) FROM app a2)
+            )
+            SELECT
+                 a.oapp_id                                                                AS id
+                ,DATE_FORMAT(a.nextdate, '%Y-%m-%d')                                      AS app_date
+                ,TIME_FORMAT(a.nexttime, '%H:%i')                                         AS app_time
+                ,a.hn                                                                     AS hn
+                ,CONCAT(IFNULL(p.pname,''), IFNULL(p.fname,''), ' ', IFNULL(p.lname,''))  AS ptname
+                ,p.sex                                                                    AS sex
+                ,TIMESTAMPDIFF(YEAR, p.birthday, a.nextdate)                              AS age
+                ,p.hometel                                                                AS hometel
+                ,p.informtel                                                              AS informtel
+                ,p.worktel                                                                AS worktel
+                ,c.department                                                             AS department
+                ,d.name                                                                   AS spcname
+                ,a.app_cause                                                              AS app_cause
+                ,s.oapp_status_name                                                       AS app_status
+                ,DATE_FORMAT(i.ConfirmDate, '%Y-%m-%d')                                   AS confirm_date
+                ,i.Hospital_LabNumber                                                     AS lab_no
+                ,i.Specimen                                                               AS specimen
+                ,TRIM(SUBSTRING_INDEX(i.ResultValue, '(', 1))                             AS organism
+                ,TRIM(SUBSTRING_INDEX(SUBSTRING_INDEX(i.ResultValue, '(', -1), ')', 1))   AS resistance
+                ,i.result_count                                                           AS result_count
+                ,DATEDIFF(a.nextdate, i.ConfirmDate)                                      AS days_since
+            FROM app a
+            JOIN inf i                ON i.hn = a.hn AND i.rn = 1
+            LEFT JOIN patient p       ON p.hn = a.hn
+            LEFT JOIN kskdepartment c ON c.depcode = a.depcode
+            LEFT JOIN spclty d        ON d.spclty  = a.spclty
+            LEFT JOIN oapp_status s   ON s.oapp_status_id = a.oapp_status_id
+            -- เรียงตามวันที่พบเชื้อ คนที่ใกล้ครบ 90 วันที่สุดอยู่บนสุด เพราะเป็นกลุ่มที่ต้องปิดเคสก่อน
+            ORDER BY i.ConfirmDate ASC, a.nexttime ASC
+        `;
+
+        const [rows] = await his.execute<RowDataPacket[]>(sql, [date, date, date]);
+
+        const data = rows.map(row => {
+            const daysSince = Number(row.days_since);
+            return {
+                id: Number(row.id),
+                app_date: row.app_date,
+                app_time: row.app_time ?? null,
+                hn: row.hn,
+                ptname: sanitizeHTML(String(row.ptname ?? '').trim()) || null,
+                sex: row.sex === '1' ? 'ชาย' : row.sex === '2' ? 'หญิง' : null,
+                age: row.age === null ? null : Number(row.age),
+                hometel: row.hometel ? sanitizeHTML(row.hometel) : null,
+                informtel: row.informtel ? sanitizeHTML(row.informtel) : null,
+                worktel: row.worktel ? sanitizeHTML(row.worktel) : null,
+                department: row.department ? sanitizeHTML(cleanDepartment(String(row.department))) : null,
+                spcname: row.spcname ? sanitizeHTML(row.spcname) : null,
+                app_cause: row.app_cause ? sanitizeHTML(row.app_cause) : null,
+                app_status: row.app_status ? sanitizeHTML(row.app_status) : null,
+                confirm_date: row.confirm_date,
+                lab_no: row.lab_no,
+                specimen: row.specimen ? sanitizeHTML(row.specimen) : null,
+                organism: sanitizeHTML(String(row.organism ?? '').trim()),
+                resistance: sanitizeHTML(String(row.resistance ?? '').trim()),
+                result_count: Number(row.result_count),
+                days_since: daysSince,
+                // วันที่เหลือก่อนพ้นการเฝ้าระวัง คนที่เหลือน้อยคือคนที่ต้องตามให้จบก่อน
+                days_left: SURVEILLANCE_DAYS - daysSince,
+            };
+        });
+
+        const byGroup = new Map<string, number>();
+        for (const r of data) {
+            const g = r.resistance || 'ไม่ระบุกลุ่ม';
+            byGroup.set(g, (byGroup.get(g) ?? 0) + 1);
+        }
+
+        return {
+            success: true,
+            data,
+            summary: {
+                date,
+                surveillance_days: SURVEILLANCE_DAYS,
+                appointments: data.length,
+                // นับคนแยกจากนับนัด เพราะคนหนึ่งอาจมีนัดหลายคลินิกในวันเดียวกัน
+                patients: new Set(data.map(r => r.hn)).size,
+                departments: new Set(data.map(r => r.department).filter(Boolean)).size,
+                ending_soon: data.filter(r => r.days_left <= 7).length,
+                repeat_positive: data.filter(r => r.result_count > 1).length,
+                by_resistance: [...byGroup.entries()]
+                    .map(([name, count]) => ({ name, count }))
+                    .sort((a, b) => b.count - a.count),
+            },
+        };
+    } catch (error) {
+        console.error('Get OPD infection followup error:', error);
         set.status = 500;
         return { success: false, message: 'Internal Server Error' };
     }

@@ -5,11 +5,11 @@ import {
     getNurseScheduleDetail,
     deleteNurseSchedule,
     getNurseSchedule,
-    getFTEByWard,
     getNurseShiftTypes,
     getNurseScheduleByDate,
     getStaffOnDutyByDate
 } from '../controllers/nurseController';
+import { getFTEByWard } from '../controllers/fteController';
 import { generateSchedule } from '../controllers/autoScheduleController';
 
 export const nurseRoutes = new Elysia({ prefix: '/api/v1/nurse' })

@@ -17,6 +17,10 @@ import { positionRoutes } from "./routes/positionRoutes";
 import { rateRoutes } from "./routes/rateRoutes";
 import { wardQuotaRoutes } from "./routes/wardQuotaRoutes";
 import { holidayRoutes } from "./routes/holidayRoutes";
+import { vendorRoutes } from "./routes/vendorRoutes";
+import { rxOrderRoutes } from "./routes/rxOrderRoutes";
+import { rxRealtimeRoutes, setRealtimeServer } from "./realtime";
+import { vendorAdminRoutes } from "./routes/vendorAdminRoutes";
 
 const app = new Elysia()
   .use(corsMiddleware)
@@ -45,6 +49,7 @@ const app = new Elysia()
           { name: "Rates", description: "อัตราค่าตอบแทนต่อเวร แยกตามกลุ่มตำแหน่ง" },
           { name: "Ward Quotas", description: "อัตรากำลังต่อเวร แยกตามหอผู้ป่วยและกลุ่มตำแหน่ง" },
           { name: "Holidays", description: "วันหยุดขององค์กร (ไม่รวมเสาร์–อาทิตย์)" },
+          { name: "Vendor", description: "บริษัทผู้รับจ้างทำอาหาร เข้าดูยอดของตัวเอง บัญชีแยกจากเจ้าหน้าที่" },
         ],
         components: {
           securitySchemes: {
@@ -73,8 +78,20 @@ const app = new Elysia()
   .use(rateRoutes)
   .use(wardQuotaRoutes)
   .use(holidayRoutes)
+  .use(rxOrderRoutes)
+  .use(vendorRoutes)
+  .use(vendorAdminRoutes)
+
+  /*
+    WebSocket ใช้พอร์ตเดียวกับ API ไม่เปิดพอร์ตที่สอง
+    จะได้ไม่ต้องขอเปิดไฟร์วอลล์เพิ่ม และอยู่โดเมนเดียวกับ REST ทั้งหมด
+  */
+  .use(rxRealtimeRoutes)
 
   .listen(4000);
+
+/* ตัวเซิร์ฟเวอร์ใช้ส่งข้อความจากนอก handler เช่นตอนบันทึกใบสั่งยาเสร็จใน REST */
+setRealtimeServer(app.server);
 
 console.log(
   `🦊 Elysia is running at ${app.server?.hostname}:${app.server?.port}`

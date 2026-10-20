@@ -2,6 +2,9 @@ import { Elysia, t } from 'elysia';
 import { authMiddleware } from '../middlewares/authMiddleware';
 import { getAiSetting, setAiSetting } from '../controllers/systemSettingsController';
 import {
+    getMyMenuAccess, getMenuMatrix, saveMenuAccess, resetMenuAccess,
+} from '../controllers/menuAccessController';
+import {
     getWardsV1,
     getSpclty,
     getAdmissionType,
@@ -31,5 +34,28 @@ export const systemRoutes = new Elysia({ prefix: '/api/v1/system' })
     .put('/ai-setting', setAiSetting, {
         body: t.Object({ enabled: t.Boolean() }),
         detail: { summary: 'เปิด/ปิดผู้ช่วย AI ทั้งระบบ (เฉพาะผู้ดูแลระบบ)' },
+    })
+
+    // ---------- การมองเห็นเมนูรายกลุ่ม ----------
+    // ทุกคนอ่านของตัวเองได้ หน้าจอต้องรู้ว่าจะวาดเมนูไหน
+    .get('/menu-access', getMyMenuAccess, {
+        detail: { summary: 'กลุ่มของผู้ใช้คนนี้ และข้อยกเว้นการมองเห็นเมนูของกลุ่มนั้น' },
+    })
+    .get('/menu-access/matrix', getMenuMatrix, {
+        detail: { summary: 'ตารางสิทธิ์เมนูทั้งหมด (เฉพาะผู้ดูแลระบบ)' },
+    })
+    .post('/menu-access', saveMenuAccess, {
+        body: t.Object({
+            items: t.Array(t.Object({
+                menu_key: t.String(),
+                group_key: t.String(),
+                visible: t.Boolean(),
+            })),
+        }),
+        detail: { summary: 'บันทึกการเปิด/ปิดเมนูรายกลุ่ม (เฉพาะผู้ดูแลระบบ)' },
+    })
+    .post('/menu-access/reset', resetMenuAccess, {
+        body: t.Object({ menu_key: t.Optional(t.String()) }),
+        detail: { summary: 'คืนค่าเริ่มต้นของเมนู ไม่ระบุ = ทั้งหมด (เฉพาะผู้ดูแลระบบ)' },
     });
     

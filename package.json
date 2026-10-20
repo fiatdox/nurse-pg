@@ -13,7 +13,8 @@
     "elysia": "latest",
     "mysql2": "^3.22.3",
     "postgres": "^3.4.9",
-    "sanitize-html": "^2.17.3"
+    "sanitize-html": "^2.17.3",
+    "tesseract.js": "^7.0.0"
   },
   "devDependencies": {
     "bun-types": "latest"

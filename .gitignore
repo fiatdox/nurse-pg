@@ -41,3 +41,5 @@ yarn-error.log*
 **/*.log
 package-lock.json
 **/*.bun
+# ไฟล์ใบสั่งยาที่หอผู้ป่วยอัปโหลด เป็นข้อมูลผู้ป่วย ห้ามเข้า git
+uploads/

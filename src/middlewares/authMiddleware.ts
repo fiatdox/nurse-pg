@@ -9,6 +9,12 @@ if (!process.env.JWT_SECRET) {
     throw new Error('JWT_SECRET environment variable is required for authentication');
 }
 
+/** ค่าของ typ ใน JWT ที่บอกว่า token ใบนี้เป็นของบริษัทผู้รับจ้าง ไม่ใช่เจ้าหน้าที่ */
+export const VENDOR_TOKEN = 'vendor';
+
+/** ค่าของ typ สำหรับเจ้าหน้าที่ ใส่ไว้เพื่ออ่านง่าย token รุ่นเก่าไม่มีฟิลด์นี้ */
+export const STAFF_TOKEN = 'staff';
+
 export const authMiddleware = (app: Elysia) =>
     app.use(
         jwt({
@@ -29,7 +35,7 @@ export const authMiddleware = (app: Elysia) =>
             // Properly verify JWT with expiration check enabled
             const userPayload = await jwt.verify(token);
             return {
-                user: userPayload as { username: string } | null
+                user: userPayload as { username: string; typ?: string } | null
             };
         } catch {
             // Token is invalid or expired
@@ -39,8 +45,17 @@ export const authMiddleware = (app: Elysia) =>
     // .onBeforeHandle is a hook that runs before the main route handler.
     // We use it to protect routes by checking if a user is authenticated.
     .onBeforeHandle(async ({ user, set }) => {
-        // Check if user is authenticated
-        if (!user) {
+        /*
+          token ของบริษัทผู้รับจ้างถูกเซ็นด้วยกุญแจดอกเดียวกับของเจ้าหน้าที่
+          ถ้าไม่คัดชนิดตรงนี้ มันจะผ่านทุก route ที่ใช้ middleware ตัวนี้
+          ซึ่งรวมถึงรายชื่อผู้ป่วย ผล lab และบันทึกทางการพยาบาล
+
+          เขียนเป็น "ปฏิเสธ vendor" ไม่ใช่ "อนุญาตเฉพาะ staff" เพราะ token
+          ของเจ้าหน้าที่ที่ออกไปก่อนหน้านี้ยังไม่มีฟิลด์ typ ถ้าเขียนแบบหลัง
+          ทุกคนจะหลุดออกจากระบบทันทีที่ deploy — token มีอายุ 8 ชม.
+          พ้นวันเดียวแล้วค่อยเปลี่ยนเป็น allow-list ซึ่งปลอดภัยกว่าในระยะยาว
+        */
+        if (!user || (user as { typ?: string }).typ === VENDOR_TOKEN) {
             set.status = 401;
             return { success: false, message: 'Unauthorized' };
         }
