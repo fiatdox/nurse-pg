@@ -6,7 +6,7 @@ import { nurse, his } from '../db';
 import type { RowDataPacket } from 'mysql2';
 import { resolveActor } from '../utils/nursingRecord';
 import { sanitizeHTML } from '../utils/sanitize';
-import { padHn } from '../utils/hn';
+import { padHn, HN_LENGTH } from '../utils/hn';
 import { admissionsOf, hisWardCode } from './rxHnReaderController';
 import { retentionDays } from './rxRetentionController';
 import { emitRxOrder, type RxStatus } from '../realtime';
@@ -172,6 +172,15 @@ export const createRxOrder = async ({ body, user, set }: Context & { user?: unkn
     }
 
     const hn = padHn(String(b.hn ?? ''));
+    /*
+      ทุกใบต้องมี HN — หน้าจอบังคับไว้แล้ว ตรวจซ้ำที่นี่เพราะเรียก API ตรงได้
+      ใบที่ไม่มี HN ห้องยาต้องอ่านเลขจากภาพเอง ซึ่งเป็นจุดที่จ่ายยาผิดคนได้ง่ายที่สุด
+      HIS ล่มยังส่งได้ (พิมพ์ HN เอง) แค่ his_verified เป็น false
+    */
+    if (!new RegExp(`^\\d{${HN_LENGTH}}$`).test(hn)) {
+        set.status = 400;
+        return { success: false, message: `กรุณาระบุ HN ของใบสั่งยา (ตัวเลขไม่เกิน ${HN_LENGTH} หลัก)` };
+    }
     const an = String(b.an ?? '').trim();
     const hnSource = ['barcode', 'pdf_text', 'ocr', 'manual'].includes(String(b.hn_source))
         ? String(b.hn_source) : 'manual';

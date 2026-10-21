@@ -622,7 +622,7 @@ export const getAmrPatientReport = async (
 };
 
 /** ชื่อหน่วยงานใน HIS มีรหัสต่อท้ายแบบ "หอผู้ป่วยอายุรกรรม 2 [1560,1535]" ซึ่งไม่ต้องแสดง */
-const cleanDepartment = (name: string) => name.replace(/\s*\[[^\]]*\]\s*$/, '').trim();
+export const cleanDepartment = (name: string) => name.replace(/\s*\[[^\]]*\]\s*$/, '').trim();
 
 const TOP_DEPARTMENTS = 10;
 const TOP_ORGANISMS = 8;

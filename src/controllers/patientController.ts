@@ -3,6 +3,7 @@ import { his, nurse } from '../db';
 import { RowDataPacket } from 'mysql2';
 import { sanitizeHTML } from '../utils/sanitize';
 import { resolveActor } from '../utils/nursingRecord';
+import { wardGroupOf, groupInfo } from '../utils/wardGroup';
 
 // ฟังก์ชันสำหรับดึงข้อมูลผู้ป่วยตาม ward
 export const getPatientsByWard = async ({ body, set }: Context) => {
@@ -1003,6 +1004,13 @@ export const getPatientShiftDailyRecordsSummary = async ({ body, set }: Context)
         : date;
 
     try {
+        /*
+          การ์ดสรุปรายเวรคิดรวมทั้งหน่วย (เช่น Nursery + NICU) ให้ตรงกับ FTE และตารางเวรที่จัดรวมกัน
+          ส่วนรายชื่อผู้ป่วยในหน้าเดียวกันยังแยกตามหอที่เลือก
+        */
+        const group = await wardGroupOf(ward);
+        const codes = group?.codes ?? [ward];
+
         const rows = await nurse`
             SELECT
                  acst.admission_change_shift_type_id
@@ -1013,7 +1021,7 @@ export const getPatientShiftDailyRecordsSummary = async ({ body, set }: Context)
                 ,(
                     SELECT COUNT(*)
                     FROM admission_list al2
-                    WHERE al2.ward = ${ward}
+                    WHERE al2.ward IN ${nurse(codes)}
                       AND al2.admission_type_id = 1
                       AND al2.reg_datetime::date = ${parsedDate}::date
                       AND al2.admission_change_shift_type_id = acst.admission_change_shift_type_id
@@ -1022,7 +1030,7 @@ export const getPatientShiftDailyRecordsSummary = async ({ body, set }: Context)
                 ,(
                     SELECT COUNT(*)
                     FROM admission_list al2
-                    WHERE al2.ward = ${ward}
+                    WHERE al2.ward IN ${nurse(codes)}
                       AND al2.admission_type_id = 2
                       AND al2.reg_datetime::date = ${parsedDate}::date
                       AND al2.admission_change_shift_type_id = acst.admission_change_shift_type_id
@@ -1087,7 +1095,7 @@ export const getPatientShiftDailyRecordsSummary = async ({ body, set }: Context)
                   AND asdr.deleted_at IS NULL
             LEFT JOIN admission_list al
                    ON al.admission_list_id = asdr.admission_list_id
-                  AND al.ward = ${ward}
+                  AND al.ward IN ${nurse(codes)}
             GROUP BY
                  acst.admission_change_shift_type_id
                 ,acst.shift_name
@@ -1095,7 +1103,12 @@ export const getPatientShiftDailyRecordsSummary = async ({ body, set }: Context)
             ORDER BY acst.admission_change_shift_type_id
         `;
 
-        return { success: true, data: rows };
+        return {
+            success: true,
+            data: rows,
+            // ค่าน้ำหนักทั่วไป/วิกฤตของหอหลัก หน้าจอใช้คิด FTE ของการ์ดให้ตรงกับรายงาน FTE
+            group: group ? { ...groupInfo(group), general: group.primary.general, crisis: group.primary.crisis } : null,
+        };
     } catch (error) {
         console.error('Get patient shift daily records summary error:', error);
         set.status = 500;

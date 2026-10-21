@@ -6,6 +6,7 @@ import {
 } from '../controllers/menuAccessController';
 import {
     getWardsV1,
+    getWardUnits,
     getSpclty,
     getAdmissionType,
     getAdmissionSeverityLV,
@@ -17,6 +18,7 @@ export const systemRoutes = new Elysia({ prefix: '/api/v1/system' })
     .use(authMiddleware)
     .guard({ detail: { tags: ['System'] } })
     .get('/wardsV1', getWardsV1)
+    .get('/ward-units', getWardUnits)
     .get('/spclty', getSpclty)
     .get('/admission-types', getAdmissionType)
     // เพิ่มเส้นทางสำหรับดึงข้อมูลประเภทเวร

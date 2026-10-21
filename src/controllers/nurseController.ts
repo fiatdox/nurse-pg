@@ -1,6 +1,13 @@
 import { Context } from 'elysia';
 import { nurse } from '../db';
 import { sanitizeHTML } from '../utils/sanitize';
+import { wardGroupOf } from '../utils/wardGroup';
+
+/**
+ * รหัส HIS ของทุกหอในหน่วยเดียวกัน — หน่วยที่รวมหลายหอ (เช่น Nursery + NICU) ใช้ตารางเวรชุดเดียว
+ * จัดที่หอหลัก แต่เวรเก่าที่เคยลงไว้ที่หอรองต้องเห็นและแก้ได้จากที่เดียวกัน ไม่งั้นนับซ้ำโดยไม่มีใครรู้
+ */
+const unitCodes = async (ward: string) => (await wardGroupOf(ward))?.codes ?? [ward];
 
 // ฟังก์ชั่นบันทึกตารางพยาบาลและเจ้าหน้าที่
 export const addNurseSchedule = async ({ body, set }: Context) => {
@@ -15,8 +22,11 @@ export const addNurseSchedule = async ({ body, set }: Context) => {
         let inserted = 0;
         let updated = 0;
 
+        const codesOf = new Map<string, string[]>();
+        for (const w of new Set(schedules.map(s => String(s.ward)))) codesOf.set(w, await unitCodes(w));
+
         // จัดกลุ่ม base codes ที่ส่งมาแต่ละ (staff_id, shift_date, ward)
-        // เพื่อลบ record ที่ไม่ได้ส่งมาใน scope นั้น
+        // เพื่อลบ record ที่ไม่ได้ส่งมาใน scope นั้น — scope ครอบทุกหอในหน่วย
         const scopeMap = new Map<string, string[]>();
         for (const s of schedules) {
             const baseCode = s.shift_code.split('_')[0];
@@ -35,7 +45,7 @@ export const addNurseSchedule = async ({ body, set }: Context) => {
                     DELETE FROM nurse_shift_assignments
                     WHERE staff_id = ${staffId}
                       AND shift_date = ${shiftDate}
-                      AND ward = ${ward}
+                      AND ward IN ${sql(codesOf.get(ward)!)}
                       AND NOT (shift_code = ANY(${baseCodes}) OR shift_code LIKE ANY(${likePatterns}))
                 `;
             }
@@ -45,13 +55,14 @@ export const addNurseSchedule = async ({ body, set }: Context) => {
                 const baseCode = s.shift_code.split('_')[0];
                 const likePattern = `${baseCode}\\_%`;
 
+                // แถวของหอที่ส่งมาก่อน แล้วค่อยแถวที่ค้างอยู่ที่หออื่นในหน่วย
                 const existing = await sql`
-                    SELECT shift_assignment_id FROM nurse_shift_assignments
+                    SELECT shift_assignment_id, ward FROM nurse_shift_assignments
                     WHERE staff_id = ${s.staff_id}
                       AND shift_date = ${s.shift_date}
-                      AND ward = ${s.ward}
+                      AND ward IN ${sql(codesOf.get(String(s.ward))!)}
                       AND (shift_code = ${baseCode} OR shift_code LIKE ${likePattern})
-                    LIMIT 1
+                    ORDER BY (ward = ${s.ward}) DESC, shift_assignment_id
                 `;
 
                 if (existing.length > 0) {
@@ -63,6 +74,11 @@ export const addNurseSchedule = async ({ body, set }: Context) => {
                             updated_by = ${s.updated_by || s.created_by || null}
                         WHERE shift_assignment_id = ${existing[0].shift_assignment_id}
                     `;
+                    // เวรเดียวกันของคนเดียวกันที่ลงไว้อีกหอในหน่วย = ขึ้นเวรเดียวแต่ถูกนับสองครั้ง
+                    const stray = existing.slice(1).filter(r => r.ward !== s.ward).map(r => r.shift_assignment_id);
+                    if (stray.length > 0) {
+                        await sql`DELETE FROM nurse_shift_assignments WHERE shift_assignment_id IN ${sql(stray)}`;
+                    }
                     updated++;
                 } else {
                     await sql`
@@ -101,6 +117,7 @@ export const getNurseScheduleDetail = async ({ body, set }: Context) => {
     }
 
     try {
+        const codes = await unitCodes(ward);
         const rows = shift_code
             ? await nurse`
                 SELECT
@@ -116,7 +133,7 @@ export const getNurseScheduleDetail = async ({ body, set }: Context) => {
                     sa.updated_by
                 FROM nurse_shift_assignments sa
                 LEFT JOIN staffs s ON sa.staff_id = s.staff_id
-                WHERE sa.ward = ${ward}
+                WHERE sa.ward IN ${nurse(codes)}
                   AND sa.shift_date = ${shift_date}
                   AND sa.staff_id = ${staff_id}
                   AND sa.shift_code = ${shift_code}
@@ -135,7 +152,7 @@ export const getNurseScheduleDetail = async ({ body, set }: Context) => {
                     sa.updated_by
                 FROM nurse_shift_assignments sa
                 LEFT JOIN staffs s ON sa.staff_id = s.staff_id
-                WHERE sa.ward = ${ward}
+                WHERE sa.ward IN ${nurse(codes)}
                   AND sa.shift_date = ${shift_date}
                   AND sa.staff_id = ${staff_id}
             `;
@@ -250,6 +267,7 @@ export const getNurseScheduleByDate = async ({ body, set }: Context) => {
     try {
         // ตรวจสอบว่าส่งมาแค่เดือน (ยาว 7 ตัว เช่น 2026-03) หรือส่งมาเต็มวัน (ยาว 10 ตัว เช่น 2026-03-01)
         const isMonthOnly = date.length === 7;
+        const codes = await unitCodes(ward);
 
         const rows = isMonthOnly
             ? await nurse`
@@ -262,7 +280,7 @@ export const getNurseScheduleByDate = async ({ body, set }: Context) => {
                     sa.ward
                 FROM nurse_shift_assignments sa
                 LEFT JOIN staffs s ON sa.staff_id = s.staff_id
-                WHERE sa.ward = ${ward} AND TO_CHAR(sa.shift_date, 'YYYY-MM') = ${date}
+                WHERE sa.ward IN ${nurse(codes)} AND TO_CHAR(sa.shift_date, 'YYYY-MM') = ${date}
                 ORDER BY sa.shift_date ASC, sa.shift_code ASC, sa.staff_id ASC
             `
             : await nurse`
@@ -275,7 +293,7 @@ export const getNurseScheduleByDate = async ({ body, set }: Context) => {
                     sa.ward
                 FROM nurse_shift_assignments sa
                 LEFT JOIN staffs s ON sa.staff_id = s.staff_id
-                WHERE sa.ward = ${ward} AND sa.shift_date = ${date}
+                WHERE sa.ward IN ${nurse(codes)} AND sa.shift_date = ${date}
                 ORDER BY sa.shift_date ASC, sa.shift_code ASC, sa.staff_id ASC
             `;
 
@@ -315,6 +333,9 @@ export const getStaffOnDutyByDate = async ({ body, set }: Context) => {
     const parsedDate = date.includes('/') ? date.split('/').reverse().join('-') : date;
 
     try {
+        // หน่วยที่รวมหลายหอ (เช่น Nursery + NICU) จัดเวรรวมกัน นับคนจากทุกหอในหน่วย
+        const codes = await unitCodes(ward);
+
         const rows = await nurse`
             SELECT
                  nst.admission_change_shift_type_id       AS shift_type_id
@@ -329,7 +350,7 @@ export const getStaffOnDutyByDate = async ({ body, set }: Context) => {
               ON acst.admission_change_shift_type_id = nst.admission_change_shift_type_id
             LEFT JOIN staffs s ON s.staff_id = sa.staff_id
             LEFT JOIN staff_position sp ON sp.staff_position_id = s.staff_position_id
-            WHERE sa.ward = ${ward}
+            WHERE sa.ward IN ${nurse(codes)}
               AND sa.shift_date = ${parsedDate}
               -- OFF ผูกกับ shift type 0 ซึ่งไม่ใช่เวรจริง ต้องไม่นับเป็นคนขึ้นเวร
               AND nst.admission_change_shift_type_id > 0

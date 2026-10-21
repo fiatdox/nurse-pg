@@ -6,6 +6,7 @@ import {
 } from '../controllers/rxOrderController';
 import { readRxHn } from '../controllers/rxHnReaderController';
 import { getRxRetention } from '../controllers/rxRetentionController';
+import { getRxDashboard } from '../controllers/rxDashboardController';
 
 /**
  * ใบสั่งยาจากหอผู้ป่วยถึงห้องยา
@@ -89,6 +90,15 @@ export const rxOrderRoutes = new Elysia({ prefix: '/api/v1/rx' })
         detail: { summary: 'เปิดดูไฟล์ใบสั่งยา (บันทึกลงประวัติทุกครั้งที่เปิด) · ไฟล์ที่ลบตามกำหนดแล้วได้ 410' },
     })
 
+    .get('/dashboard', getRxDashboard, {
+        query: t.Object({
+            from: t.Optional(t.String()),
+            to: t.Optional(t.String()),
+            wards: t.Optional(t.String()),
+            priorities: t.Optional(t.String()),
+        }),
+        detail: { summary: 'Dashboard ระบบส่งใบสั่งยา — ปริมาณงาน เวลาแต่ละขั้น ความทันเวลา รายหอ รายคน (เฉพาะผลรวม ไม่มีข้อมูลผู้ป่วย)' },
+    })
     .get('/retention', getRxRetention, {
         query: t.Object({ days: t.Optional(t.String()) }),
         detail: { summary: 'จำนวนวันที่เก็บไฟล์ใบสั่งยา (ตั้งใน .env: RX_FILE_RETENTION_DAYS) และจำนวนไฟล์ที่จะถูกลบ (?days=N ดูล่วงหน้า)' },

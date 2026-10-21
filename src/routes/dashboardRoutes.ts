@@ -7,6 +7,7 @@ import {
     getBedOccupancy,
     getCareLevelFlow,
 } from '../controllers/dashboardController';
+import { getStaffingAnalytics } from '../controllers/staffingController';
 
 const rangeBody = t.Object({
     ward: t.String(),
@@ -37,4 +38,15 @@ export const dashboardRoutes = new Elysia({ prefix: '/api/v1/dashboard' })
     .post('/care-level-flow', getCareLevelFlow, {
         body: rangeBody,
         detail: { summary: 'การเปลี่ยนระดับการดูแลของผู้ป่วยข้ามเวร ดึก → เช้า → บ่าย (Sankey)' },
+    })
+    .post('/staffing', getStaffingAnalytics, {
+        body: t.Object({
+            date_from: t.String(),
+            date_to: t.String(),
+            /* รหัส HIS ของหอ ไม่ส่ง/ว่าง = ทุกหอที่เปิดใช้งาน · หอที่รวมเป็นหน่วยเดียวกันขยายให้เอง */
+            wards: t.Optional(t.Array(t.String(), { maxItems: 100 })),
+            /* 1 = ดึก · 2 = เช้า · 3 = บ่าย ไม่ส่ง/ว่าง = ทุกเวร */
+            shifts: t.Optional(t.Array(t.Number(), { maxItems: 3 })),
+        }),
+        detail: { summary: 'วิเคราะห์อัตรากำลังพยาบาล หลายหอ หลายเวร ตามช่วงวันที่ (productivity, ขาด/เกิน, OT, skill mix, รายบุคคล)' },
     });

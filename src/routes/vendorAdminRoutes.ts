@@ -5,7 +5,10 @@ import {
     saveVendor,
     setVendorFoodTypes,
     createVendorAccount,
+    updateVendorIdentity,
+    resetVendorCredentials,
     updateVendorAccount,
+    getVendorAccountHistory,
 } from '../controllers/vendorAdminController';
 
 /**
@@ -44,18 +47,45 @@ export const vendorAdminRoutes = new Elysia({ prefix: '/api/v1/vendor-admin' })
         body: t.Object({
             vendor_id: t.Number(),
             username: t.String({ minLength: 4, maxLength: 64 }),
-            password: t.String({ minLength: 10, maxLength: 200 }),
-            display_name: t.String({ minLength: 1, maxLength: 150 }),
+            first_name: t.String({ minLength: 1, maxLength: 100 }),
+            last_name: t.String({ minLength: 1, maxLength: 100 }),
+            job_title: t.Optional(t.String({ maxLength: 100 })),
+            phone: t.String({ minLength: 9, maxLength: 30 }),
+            national_id: t.String({ minLength: 13, maxLength: 20 }),
+            // ต้องเป็น true เท่านั้น — ผู้ดูแลยืนยันว่าเห็นบัตรประชาชนตัวจริงแล้ว
+            identity_checked: t.Literal(true),
         }),
-        detail: { summary: 'เพิ่มบัญชีเข้าระบบให้บริษัท' }
+        detail: { summary: 'เปิดบัญชีรายบุคคล ได้รหัสผ่านชั่วคราวกลับไปครั้งเดียว' }
+    })
+    .put('/account/identity', updateVendorIdentity, {
+        body: t.Object({
+            vendor_account_id: t.Number(),
+            first_name: t.String({ minLength: 1, maxLength: 100 }),
+            last_name: t.String({ minLength: 1, maxLength: 100 }),
+            job_title: t.Optional(t.String({ maxLength: 100 })),
+            phone: t.String({ minLength: 9, maxLength: 30 }),
+            // ไม่ส่ง = ไม่เปลี่ยน ยกเว้นบัญชีที่ยังไม่มีเลขบัตรซึ่งต้องกรอก
+            national_id: t.Optional(t.String({ maxLength: 20 })),
+            identity_checked: t.Literal(true),
+        }),
+        detail: { summary: 'แก้ไข/กรอกข้อมูลบุคคลและยืนยันตัวตน' }
+    })
+    .post('/account/reset', resetVendorCredentials, {
+        body: t.Object({
+            vendor_account_id: t.Number(),
+        }),
+        detail: { summary: 'ออกรหัสผ่านชั่วคราวใหม่ (ลืมรหัสผ่าน)' }
     })
     .patch('/account', updateVendorAccount, {
         body: t.Object({
             vendor_account_id: t.Number(),
-            password: t.Optional(t.String({ minLength: 10, maxLength: 200 })),
-            display_name: t.Optional(t.String({ maxLength: 150 })),
             is_active: t.Optional(t.Boolean()),
             unlock: t.Optional(t.Boolean()),
+            revoke_session: t.Optional(t.Boolean()),
         }),
-        detail: { summary: 'ตั้งรหัสผ่านใหม่ เปิด/ปิดบัญชี หรือปลดล็อก' }
+        detail: { summary: 'เปิด/ปิดบัญชี ปลดล็อก หรือตัดการเข้าใช้ที่ค้างอยู่' }
+    })
+    .get('/account/history', getVendorAccountHistory, {
+        query: t.Object({ vendor_account_id: t.Numeric() }),
+        detail: { summary: 'ประวัติการเข้าระบบ การจัดการบัญชี และการเรียกใช้ของบัญชีหนึ่ง' }
     });
