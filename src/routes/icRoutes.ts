@@ -1,6 +1,7 @@
 import { Elysia, t } from 'elysia';
 import { authMiddleware } from '../middlewares/authMiddleware';
 import { getIpdPatientHistoryDaily, getOpdPatientHistoryDaily, getResultInFiscalYear, getResultDepInFiscalYear, operationFollowup, getLabno, getMdroSankeyFiscalYear, getAmrPatientReport, getOpdInfectionFollowup } from '../controllers/icController';
+import { getIcAnalytics } from '../controllers/icAnalyticsController';
 
 export const icRoutes = new Elysia({ prefix: '/api/v1/ic' })
     .use(authMiddleware)
@@ -32,6 +33,10 @@ export const icRoutes = new Elysia({ prefix: '/api/v1/ic' })
     .get('/mdro-sankey-fiscal-year', getMdroSankeyFiscalYear, {
         query: t.Object({ fy: t.Optional(t.String()) }),
         detail: { summary: 'เส้นทางเชื้อดื้อยาตามปีงบประมาณ (?fy=พ.ศ. ไม่ส่ง = ปีปัจจุบัน) หน่วยงาน → เชื้อ → กลุ่มดื้อยา (สำหรับกราฟ Sankey)' }
+    })
+    .get('/analytics', getIcAnalytics, {
+        query: t.Object({ fy: t.Optional(t.String()) }),
+        detail: { summary: 'วิเคราะห์เชื้อดื้อยาตามปีงบประมาณ (?fy=พ.ศ.) รายเดือน อัตราต่อ 1,000 วันนอน ติดในโรงพยาบาล สัญญาณกลุ่มก้อน — ยอดรวมเท่านั้น' }
     })
     .post('/operation-followup', operationFollowup, {
         body: t.Object({

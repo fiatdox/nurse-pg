@@ -1,6 +1,7 @@
 import type { Context } from 'elysia';
 import { nurse } from '../db';
 import { sanitizeHTML } from '../utils/sanitize';
+import { wardGroupOf, groupInfo, type WardGroup } from '../utils/wardGroup';
 
 type RangeBody = { ward: string; date_from: string; date_to: string };
 
@@ -11,15 +12,24 @@ const parseRange = (body: unknown) => {
 };
 
 /**
+ * หอที่นับรวมเป็นหน่วยเดียวกัน (เช่น Nursery + NICU) ทุกกราฟในหน้านี้คิดรวมทั้งหน่วย
+ * หอที่ไม่อยู่ในตาราง ward ถือเป็นหน่วยที่มีหอเดียว
+ */
+const unitOf = async (ward: string): Promise<{ group: WardGroup | null; codes: string[] }> => {
+    const group = await wardGroupOf(ward);
+    return { group, codes: group?.codes ?? [ward] };
+};
+
+/**
  * จำนวนผู้ป่วยที่ยังนอนอยู่ในหอผู้ป่วย ณ วันนั้น (census รายวัน)
  * นับผู้ป่วยที่ลงทะเบียนไม่เกินวันนั้น และยังไม่จำหน่าย หรือจำหน่ายหลังจากวันนั้น
  */
-const censusCTE = (ward: string, from: string, to: string) => nurse`
+const censusCTE = (codes: string[], from: string, to: string) => nurse`
     SELECT
          TO_CHAR(ds.d, 'YYYY-MM-DD') AS record_date
         ,(
             SELECT COUNT(*) FROM admission_list al
-            WHERE al.ward = ${ward}
+            WHERE al.ward IN ${nurse(codes)}
               AND al.reg_datetime::date <= ds.d
               AND (al.discharge_datetime IS NULL OR al.discharge_datetime::date > ds.d)
          )::int AS census
@@ -37,56 +47,50 @@ export const getIpdDailyStats = async ({ body, set }: Context) => {
     const { ward, from, to } = range;
 
     try {
-        const [daily, wardInfo, nurseCount] = await Promise.all([
+        const { group, codes } = await unitOf(ward);
+        const [daily, nurseCount] = await Promise.all([
             nurse`
                 SELECT
                      TO_CHAR(ds.d, 'YYYY-MM-DD') AS record_date
                     ,(
                         SELECT COUNT(*) FROM admission_list al
-                        WHERE al.ward = ${ward}
+                        WHERE al.ward IN ${nurse(codes)}
                           AND al.admission_type_id = 1
                           AND al.reg_datetime::date = ds.d
                      )::int AS new_admit
                     ,(
                         SELECT COUNT(*) FROM admission_list al
-                        WHERE al.ward = ${ward}
+                        WHERE al.ward IN ${nurse(codes)}
                           AND al.admission_type_id = 2
                           AND al.reg_datetime::date = ds.d
                      )::int AS transfer_in
                     ,(
                         SELECT COUNT(*) FROM admission_list al
-                        WHERE al.ward = ${ward}
+                        WHERE al.ward IN ${nurse(codes)}
                           AND al.reg_datetime::date <= ds.d
                           AND (al.discharge_datetime IS NULL OR al.discharge_datetime::date > ds.d)
                      )::int AS census
                     ,(
                         SELECT COUNT(*) FROM admission_list al
-                        WHERE al.ward = ${ward}
+                        WHERE al.ward IN ${nurse(codes)}
                           AND al.discharge_datetime::date = ds.d
                      )::int AS discharge
                 FROM generate_series(${from}::date, ${to}::date, INTERVAL '1 day') AS ds(d)
                 ORDER BY ds.d
             `,
             nurse`
-                SELECT ward_name, bed, general, crisis
-                FROM ward
-                WHERE his_code = ${ward}
-                LIMIT 1
-            `,
-            nurse`
                 SELECT COUNT(DISTINCT nsa.staff_id)::int AS n
                 FROM nurse_shift_assignments nsa
                 JOIN nurse_shift_types nst ON nst.nurse_shift_type_id = nsa.nurse_shift_type_id
-                WHERE nsa.ward = ${ward}
+                WHERE nsa.ward IN ${nurse(codes)}
                   AND nsa.shift_date BETWEEN ${from}::date AND ${to}::date
                   AND nst.code <> 'OFF'
             `,
         ]);
 
-        const w = wardInfo[0];
         // มาตรฐานชั่วโมงการพยาบาล (NHPPD) ต่อผู้ป่วย 1 คน/วัน — แปลงเป็นอัตราส่วน พยาบาล:ผู้ป่วย ต่อเวร 8 ชม.
         // 3 เวร/วัน → พยาบาล 1 คนดูแลได้ (8 x 3) / NHPPD คน
-        const nhppd = Number(w?.general ?? 0);
+        const nhppd = group?.primary.general ?? 0;
         const standardRatio = nhppd > 0 ? Math.round((24 / nhppd) * 10) / 10 : 0;
 
         const rows = daily.map(r => ({
@@ -109,7 +113,8 @@ export const getIpdDailyStats = async ({ body, set }: Context) => {
             success: true,
             data: {
                 ward,
-                ward_name: sanitizeHTML(w?.ward_name ?? ''),
+                ward_name: sanitizeHTML(group?.label ?? ''),
+                group: group ? groupInfo(group) : null,
                 daily: rows,
                 summary: {
                     totalPatientDays,
@@ -121,8 +126,8 @@ export const getIpdDailyStats = async ({ body, set }: Context) => {
                     nurseCount: nurseCount[0]?.n ?? 0,
                     standardRatio,
                     nursingHourStandard: nhppd,
-                    crisisHourStandard: Number(w?.crisis ?? 0),
-                    totalBeds: w?.bed ?? null,
+                    crisisHourStandard: group?.primary.crisis ?? 0,
+                    totalBeds: group?.bed ?? null,
                     days,
                 },
             },
@@ -144,6 +149,7 @@ export const getNurseWorkload = async ({ body, set }: Context) => {
     const { ward, from, to } = range;
 
     try {
+        const { codes } = await unitOf(ward);
         const rows = await nurse`
             WITH assign AS (
                 SELECT
@@ -154,7 +160,7 @@ export const getNurseWorkload = async ({ body, set }: Context) => {
                 FROM nurse_shift_assignments nsa
                 JOIN nurse_shift_types nst
                   ON nst.nurse_shift_type_id = nsa.nurse_shift_type_id
-                WHERE nsa.ward = ${ward}
+                WHERE nsa.ward IN ${nurse(codes)}
                   AND nsa.shift_date BETWEEN ${from}::date AND ${to}::date
                   AND nst.code <> 'OFF'
             ),
@@ -163,7 +169,7 @@ export const getNurseWorkload = async ({ body, set }: Context) => {
                      ds.d AS record_date
                     ,(
                         SELECT COUNT(*) FROM admission_list al
-                        WHERE al.ward = ${ward}
+                        WHERE al.ward IN ${nurse(codes)}
                           AND al.reg_datetime::date <= ds.d
                           AND (al.discharge_datetime IS NULL OR al.discharge_datetime::date > ds.d)
                      )::numeric AS census
@@ -234,6 +240,7 @@ export const getShiftSeverityDistribution = async ({ body, set }: Context) => {
     const { ward, from, to } = range;
 
     try {
+        const { codes } = await unitOf(ward);
         // ทุกชุดของ (วัน × เวร × ระดับความรุนแรง) ต้องมีแถวเสมอ แม้ยังไม่มีการประเมิน
         // จึง CROSS JOIN ปฏิทินกับตารางอ้างอิงก่อน แล้วค่อย LEFT JOIN ข้อมูลจริงเข้ามา
         const rows = await nurse`
@@ -256,7 +263,7 @@ export const getShiftSeverityDistribution = async ({ body, set }: Context) => {
                   AND adr.deleted_at IS NULL
             LEFT JOIN admission_list al
                    ON al.admission_list_id = adr.admission_list_id
-                  AND al.ward = ${ward}
+                  AND al.ward IN ${nurse(codes)}
             WHERE adr.admission_list_id IS NULL OR al.admission_list_id IS NOT NULL
             GROUP BY ds.d, acst.admission_change_shift_type_id, acst.shift_name,
                      sl.severity_level_id, sl.severity_level_name, sl.acuity_level_name
@@ -314,14 +321,12 @@ export const getBedOccupancy = async ({ body, set }: Context) => {
     const { ward, from, to } = range;
 
     try {
-        const [wardInfo, census] = await Promise.all([
-            nurse`SELECT ward_name, bed FROM ward WHERE his_code = ${ward} LIMIT 1`,
-            censusCTE(ward, from, to),
-        ]);
+        const { group, codes } = await unitOf(ward);
+        const census = await censusCTE(codes, from, to);
 
-        const w = wardInfo[0];
         // ward.bed อาจเป็น null ในหอที่ยังไม่ได้บันทึกจำนวนเตียง — คืน null ให้ต่างจาก 0% จริง
-        const totalBeds: number | null = w?.bed ?? null;
+        // หน่วยที่รวมหลายหอ ถ้าหอไหนยังไม่มีจำนวนเตียงก็เป็น null ทั้งหน่วย เพราะเตียงรวมจะต่ำกว่าจริง
+        const totalBeds: number | null = group?.bed ?? null;
         const days = census.length || 1;
         const avgCensus = census.reduce((a, r) => a + r.census, 0) / days;
         const peakCensus = census.reduce((a, r) => Math.max(a, r.census), 0);
@@ -330,7 +335,8 @@ export const getBedOccupancy = async ({ body, set }: Context) => {
             success: true,
             data: {
                 ward,
-                ward_name: sanitizeHTML(w?.ward_name ?? ''),
+                ward_name: sanitizeHTML(group?.label ?? ''),
+                group: group ? groupInfo(group) : null,
                 totalBeds,
                 occupied: Math.round(avgCensus * 10) / 10,
                 peakOccupied: peakCensus,
@@ -347,6 +353,91 @@ export const getBedOccupancy = async ({ body, set }: Context) => {
 };
 
 // ---------- การเปลี่ยนระดับการดูแลข้ามเวร (Sankey) ----------
+
+/**
+ * จับคู่เวรที่ต่อเนื่องกันภายในวันเดียวกัน: ดึก(1) -> เช้า(2) -> บ่าย(3)
+ * นับผู้ป่วยรายเดียวกันที่มีบันทึกทั้งสองเวร แล้วดูว่าระดับการดูแลเปลี่ยนไปอย่างไร
+ * shifts = เวรที่เลือก ใช้เฉพาะคู่ที่ทั้งสองเวรอยู่ในรายการ (ไม่ส่ง = ทุกคู่)
+ * แยกเป็นฟังก์ชันเพราะหน้าวิเคราะห์อัตรากำลังใช้คิวรีเดียวกันกับหลายหอ
+ */
+export const careLevelFlow = async (codes: string[], from: string, to: string, shifts?: number[]) => {
+    const rows = await nurse`
+        WITH shift_pairs AS (
+            SELECT 1 AS from_shift, 2 AS to_shift
+            UNION ALL
+            SELECT 2, 3
+        )
+        SELECT
+             p.from_shift
+            ,sf.shift_name       AS from_shift_name
+            ,a.admission_shift_care_level_id AS from_level_id
+            ,cf.name             AS from_level_name
+            ,p.to_shift
+            ,st.shift_name       AS to_shift_name
+            ,b.admission_shift_care_level_id AS to_level_id
+            ,ct.name             AS to_level_name
+            ,COUNT(*)::int       AS value
+        FROM shift_pairs p
+        JOIN admission_shift_daily_record a
+          ON a.shift_type_id = p.from_shift
+         AND a.record_date BETWEEN ${from}::date AND ${to}::date
+         AND a.deleted_at IS NULL
+        JOIN admission_shift_daily_record b
+          ON b.admission_list_id = a.admission_list_id
+         AND b.record_date = a.record_date
+         AND b.shift_type_id = p.to_shift
+         AND b.deleted_at IS NULL
+        JOIN admission_list al
+          ON al.admission_list_id = a.admission_list_id
+         AND al.ward IN ${nurse(codes)}
+        JOIN admission_shift_care_levels cf ON cf.admission_shift_care_level_id = a.admission_shift_care_level_id
+        JOIN admission_shift_care_levels ct ON ct.admission_shift_care_level_id = b.admission_shift_care_level_id
+        JOIN admission_change_shift_types sf ON sf.admission_change_shift_type_id = p.from_shift
+        JOIN admission_change_shift_types st ON st.admission_change_shift_type_id = p.to_shift
+        GROUP BY p.from_shift, sf.shift_name, a.admission_shift_care_level_id, cf.name,
+                 p.to_shift, st.shift_name, b.admission_shift_care_level_id, ct.name
+        ORDER BY p.from_shift, a.admission_shift_care_level_id, b.admission_shift_care_level_id
+    `;
+
+    const wanted = rows.filter(r => !shifts || (shifts.includes(r.from_shift) && shifts.includes(r.to_shift)));
+
+    // ชื่อ node ต้องไม่ซ้ำกันข้ามเวร จึงผูกชื่อเวรไว้ด้วย
+    const nodeName = (shiftName: string, levelName: string) => `${shiftName} · ${levelName}`;
+    const nodeMap = new Map<string, { name: string; shiftTypeId: number; shiftName: string; careLevelId: number; careLevelName: string }>();
+
+    const addNode = (shiftTypeId: number, shiftName: string, careLevelId: number, careLevelName: string) => {
+        const name = nodeName(sanitizeHTML(shiftName) ?? '', sanitizeHTML(careLevelName) ?? '');
+        if (!nodeMap.has(name)) {
+            nodeMap.set(name, {
+                name,
+                shiftTypeId,
+                shiftName: sanitizeHTML(shiftName) ?? '',
+                careLevelId,
+                careLevelName: sanitizeHTML(careLevelName) ?? '',
+            });
+        }
+        return name;
+    };
+
+    const links = wanted.map(r => ({
+        source: addNode(r.from_shift, r.from_shift_name, r.from_level_id, r.from_level_name),
+        target: addNode(r.to_shift, r.to_shift_name, r.to_level_id, r.to_level_name),
+        value: r.value,
+        changed: r.from_level_id !== r.to_level_id,
+    }));
+
+    const nodes = [...nodeMap.values()].sort(
+        (a, b) => a.shiftTypeId - b.shiftTypeId || a.careLevelId - b.careLevelId
+    );
+
+    return {
+        nodes,
+        links,
+        totalTransitions: links.reduce((a, l) => a + l.value, 0),
+        changedTransitions: links.filter(l => l.changed).reduce((a, l) => a + l.value, 0),
+    };
+};
+
 export const getCareLevelFlow = async ({ body, set }: Context) => {
     const range = parseRange(body);
     if (!range) {
@@ -356,84 +447,8 @@ export const getCareLevelFlow = async ({ body, set }: Context) => {
     const { ward, from, to } = range;
 
     try {
-        // จับคู่เวรที่ต่อเนื่องกันภายในวันเดียวกัน: ดึก(1) -> เช้า(2) -> บ่าย(3)
-        // นับผู้ป่วยรายเดียวกันที่มีบันทึกทั้งสองเวร แล้วดูว่าระดับการดูแลเปลี่ยนไปอย่างไร
-        const rows = await nurse`
-            WITH shift_pairs AS (
-                SELECT 1 AS from_shift, 2 AS to_shift
-                UNION ALL
-                SELECT 2, 3
-            )
-            SELECT
-                 p.from_shift
-                ,sf.shift_name       AS from_shift_name
-                ,a.admission_shift_care_level_id AS from_level_id
-                ,cf.name             AS from_level_name
-                ,p.to_shift
-                ,st.shift_name       AS to_shift_name
-                ,b.admission_shift_care_level_id AS to_level_id
-                ,ct.name             AS to_level_name
-                ,COUNT(*)::int       AS value
-            FROM shift_pairs p
-            JOIN admission_shift_daily_record a
-              ON a.shift_type_id = p.from_shift
-             AND a.record_date BETWEEN ${from}::date AND ${to}::date
-             AND a.deleted_at IS NULL
-            JOIN admission_shift_daily_record b
-              ON b.admission_list_id = a.admission_list_id
-             AND b.record_date = a.record_date
-             AND b.shift_type_id = p.to_shift
-             AND b.deleted_at IS NULL
-            JOIN admission_list al
-              ON al.admission_list_id = a.admission_list_id
-             AND al.ward = ${ward}
-            JOIN admission_shift_care_levels cf ON cf.admission_shift_care_level_id = a.admission_shift_care_level_id
-            JOIN admission_shift_care_levels ct ON ct.admission_shift_care_level_id = b.admission_shift_care_level_id
-            JOIN admission_change_shift_types sf ON sf.admission_change_shift_type_id = p.from_shift
-            JOIN admission_change_shift_types st ON st.admission_change_shift_type_id = p.to_shift
-            GROUP BY p.from_shift, sf.shift_name, a.admission_shift_care_level_id, cf.name,
-                     p.to_shift, st.shift_name, b.admission_shift_care_level_id, ct.name
-            ORDER BY p.from_shift, a.admission_shift_care_level_id, b.admission_shift_care_level_id
-        `;
-
-        // ชื่อ node ต้องไม่ซ้ำกันข้ามเวร จึงผูกชื่อเวรไว้ด้วย
-        const nodeName = (shiftName: string, levelName: string) => `${shiftName} · ${levelName}`;
-        const nodeMap = new Map<string, { name: string; shiftTypeId: number; shiftName: string; careLevelId: number; careLevelName: string }>();
-
-        const addNode = (shiftTypeId: number, shiftName: string, careLevelId: number, careLevelName: string) => {
-            const name = nodeName(sanitizeHTML(shiftName) ?? '', sanitizeHTML(careLevelName) ?? '');
-            if (!nodeMap.has(name)) {
-                nodeMap.set(name, {
-                    name,
-                    shiftTypeId,
-                    shiftName: sanitizeHTML(shiftName) ?? '',
-                    careLevelId,
-                    careLevelName: sanitizeHTML(careLevelName) ?? '',
-                });
-            }
-            return name;
-        };
-
-        const links = rows.map(r => ({
-            source: addNode(r.from_shift, r.from_shift_name, r.from_level_id, r.from_level_name),
-            target: addNode(r.to_shift, r.to_shift_name, r.to_level_id, r.to_level_name),
-            value: r.value,
-            changed: r.from_level_id !== r.to_level_id,
-        }));
-
-        const nodes = [...nodeMap.values()].sort(
-            (a, b) => a.shiftTypeId - b.shiftTypeId || a.careLevelId - b.careLevelId
-        );
-
-        return {
-            success: true,
-            data: {
-                nodes,
-                links,
-                totalTransitions: links.reduce((a, l) => a + l.value, 0),
-                changedTransitions: links.filter(l => l.changed).reduce((a, l) => a + l.value, 0),
-            },
-        };
+        const { codes } = await unitOf(ward);
+        return { success: true, data: await careLevelFlow(codes, from, to) };
     } catch (error) {
         console.error('Get care level flow error:', error);
         set.status = 500;

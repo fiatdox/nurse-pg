@@ -1,5 +1,6 @@
 import { nurse, core_kon } from '../db';
 import { sanitizeHTML } from '../utils/sanitize';
+import { wardGroupOf, groupInfo } from '../utils/wardGroup';
 import {
     HOURS_PER_SHIFT, MONTHLY_FTE_WEIGHT, MONTHLY_PRODUCT_WEIGHT, FTE_HEADCOUNT_HOURS,
     emptyStaff, addStaff, regularCount, totalCount, round2, pct,
@@ -28,11 +29,14 @@ export const getFTEByWard = async (
     }
 
     try {
-        const [wardRow] = await nurse`
-            SELECT his_code, ward_name, general, crisis
-            FROM ward WHERE his_code = ${ward} LIMIT 1`;
+        /*
+          หอที่นับรวมเป็นหน่วยเดียวกัน (เช่น Nursery + NICU) คิดเป็นรายงานเดียว
+          เลือกหอไหนในหน่วยก็ได้ผลเดียวกัน ผู้ป่วยและคนขึ้นเวรนับจากทุกหอในหน่วย
+          ค่าน้ำหนักทั่วไป/วิกฤตใช้ของหอหลัก
+        */
+        const group = await wardGroupOf(ward);
 
-        if (!wardRow) {
+        if (!group) {
             set.status = 404;
             return { success: false, message: 'ไม่พบหอผู้ป่วยที่ระบุ' };
         }
@@ -47,8 +51,8 @@ export const getFTEByWard = async (
             FROM admission_severity_level ORDER BY severity_level_id`;
 
         const params: Params = {
-            general: Number(wardRow.general),
-            crisis: Number(wardRow.crisis),
+            general: group.primary.general,
+            crisis: group.primary.crisis,
             careHours: Object.fromEntries(
                 levels.map(l => [Number(l.severity_level_id), Number(l.care_hours ?? 0)])
             ),
@@ -93,7 +97,7 @@ export const getFTEByWard = async (
                   AND a.deleted_at IS NULL
             LEFT JOIN admission_list al
                    ON al.admission_list_id = a.admission_list_id
-                  AND al.ward = ${ward}
+                  AND al.ward IN ${nurse(group.codes)}
             WHERE a.admission_shift_daily_record IS NULL OR al.admission_list_id IS NOT NULL
             GROUP BY ds.record_date, ss.shift_type_id
             ORDER BY ds.record_date, ss.shift_type_id`;
@@ -115,12 +119,13 @@ export const getFTEByWard = async (
                      WHEN nst.code LIKE '%\\_OT'  THEN 'ot8'
                      ELSE 'regular'
                  END                                 AS ot_kind
-                ,COUNT(*)::int                       AS n
+                -- นับหัวคน คนเดียวกันที่ลงเวรไว้ทั้งสองหอในหน่วยต้องไม่กลายเป็นสองคน
+                ,COUNT(DISTINCT a.staff_id)::int     AS n
             FROM nurse_shift_assignments a
             JOIN nurse_shift_types nst ON nst.nurse_shift_type_id = a.nurse_shift_type_id
             JOIN staffs s              ON s.staff_id = a.staff_id
             JOIN staff_position sp     ON sp.staff_position_id = s.staff_position_id
-            WHERE a.ward = ${ward}
+            WHERE a.ward IN ${nurse(group.codes)}
               AND nst.admission_change_shift_type_id <> 0
               AND a.shift_date >= DATE_TRUNC('month', (${month} || '-01')::date)
               AND a.shift_date <  DATE_TRUNC('month', (${month} || '-01')::date) + INTERVAL '1 month'
@@ -262,7 +267,7 @@ export const getFTEByWard = async (
             SELECT COUNT(DISTINCT a.staff_id)::int AS n
             FROM nurse_shift_assignments a
             JOIN nurse_shift_types nst ON nst.nurse_shift_type_id = a.nurse_shift_type_id
-            WHERE a.ward = ${ward}
+            WHERE a.ward IN ${nurse(group.codes)}
               AND nst.admission_change_shift_type_id <> 0
               AND a.shift_date >= DATE_TRUNC('month', (${month} || '-01')::date)
               AND a.shift_date <  DATE_TRUNC('month', (${month} || '-01')::date) + INTERVAL '1 month'`;
@@ -347,7 +352,8 @@ export const getFTEByWard = async (
             success: true,
             data: {
                 ward,
-                ward_name: sanitizeHTML(wardRow.ward_name),
+                ward_name: sanitizeHTML(group.label),
+                group: groupInfo(group),
                 month,
                 params: {
                     general: params.general,

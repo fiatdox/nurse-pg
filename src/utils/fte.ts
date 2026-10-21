@@ -89,9 +89,11 @@ export const fteOf = (ptGeneral: number, ptCrisis: number, weight: number, p: Pa
 export const productOf = (ptGeneral: number, ptCrisis: number, weight: number, staff: ShiftStaff, p: Params) =>
     safeDiv(workload(ptGeneral, ptCrisis, p) * weight, totalCount(staff) * HOURS_PER_SHIFT);
 
+/** ชั่วโมงการพยาบาลต่อเวรตามประเภทผู้ป่วย 1-5 — ตัวตั้งของ product ตามประเภท */
+export const typeWorkload = (types: number[], p: Params) =>
+    types.reduce((sum, count, i) => sum + count * (p.careHours[i + 1] ?? 0), 0) / SHIFTS_PER_DAY;
+
 /** product ที่คิดจากประเภทผู้ป่วย 1-5 แทนจำนวนหัว (คอลัมน์ U) */
-export const productByTypeOf = (types: number[], staff: ShiftStaff, p: Params) => {
-    const hours = types.reduce((sum, count, i) => sum + count * (p.careHours[i + 1] ?? 0), 0);
-    return safeDiv(hours / SHIFTS_PER_DAY, totalCount(staff) * HOURS_PER_SHIFT);
-};
+export const productByTypeOf = (types: number[], staff: ShiftStaff, p: Params) =>
+    safeDiv(typeWorkload(types, p), totalCount(staff) * HOURS_PER_SHIFT);
 

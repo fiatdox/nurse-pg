@@ -1,6 +1,7 @@
 import { Context } from 'elysia';
 import { core_kon, nurse } from '../db';
 import { sanitizeHTML } from '../utils/sanitize';
+import { wardGroupOf } from '../utils/wardGroup';
 
 
 // ฟังก์ชั่นแสดงรายชื่อเจ้าหน้าที่
@@ -138,10 +139,16 @@ export const activateStaff = async ({ params, set }: Context) => {
 
 
 // ฟังก์ชันสำหรับดึงเจ้าหน้าที่ตามหอผู้ป่วย
-export const getWardStaffByWard = async ({ params, set }: Context) => {
+export const getWardStaffByWard = async ({ params, query, set }: Context) => {
     const { id } = params as Record<string, string>;
 
     try {
+        /*
+          ?unit=1 = ทั้งทีมของหน่วยที่หอนี้อยู่ (เช่น Nursery + NICU) ใช้ตอนจัดตารางเวร
+          ไม่ส่ง = เฉพาะหอนี้ ใช้ตอนตั้งค่าคนประจำหอ ซึ่งยังบันทึกแยกหอเหมือนเดิม
+        */
+        const wards = query?.unit === '1' ? ((await wardGroupOf(id))?.codes ?? [id]) : [id];
+
         // คืน user_id มาด้วย เพราะหน้าจอเลือกคนจาก core_kon.users
         // จึงต้องใช้ user_id เป็นคีย์ในการติ๊ก ไม่ใช่ staff_id ที่เป็นเลขภายในของเรา
         const rows = await nurse`
@@ -150,7 +157,7 @@ export const getWardStaffByWard = async ({ params, set }: Context) => {
             FROM ward_staffs ws
             JOIN staffs s ON ws.staff_id = s.staff_id
             LEFT JOIN staff_position sp ON s.staff_position_id = sp.staff_position_id
-            WHERE ws.ward = ${id} AND s.is_active = 'Y'
+            WHERE ws.ward IN ${nurse(wards)} AND s.is_active = 'Y'
             -- เรียงตามลำดับวิชาชีพ ไม่ใช่ตามรหัส เพราะรหัสบังเอิญเรียงถูกอยู่ตอนนี้
             -- แต่ถ้ามีการเพิ่มกลุ่มใหม่ทีหลัง ลำดับจะเพี้ยนโดยไม่มีใครสังเกต
             ORDER BY CASE sp.code
@@ -162,9 +169,13 @@ export const getWardStaffByWard = async ({ params, set }: Context) => {
                      s.fullname
         `;
 
+        // คนที่อยู่ในรายชื่อของทั้งสองหอในหน่วย ต้องเป็นแถวเดียวในตารางเวร
+        const seen = new Set<number>();
+        const unique = rows.filter(r => !seen.has(Number(r.staff_id)) && seen.add(Number(r.staff_id)));
+
         return {
             success: true,
-            data: rows.map(row => ({
+            data: unique.map(row => ({
                 ...row,
                 fullname: sanitizeHTML(row.fullname)
             }))

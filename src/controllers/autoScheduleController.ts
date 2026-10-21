@@ -16,6 +16,7 @@
 import { Context } from 'elysia';
 import { nurse, core_kon } from '../db';
 import { sanitizeHTML } from '../utils/sanitize';
+import { wardGroupOf } from '../utils/wardGroup';
 
 const clean = (v: unknown) => sanitizeHTML(String(v ?? '').trim()) ?? '';
 
@@ -76,23 +77,32 @@ export const generateSchedule = async ({ body, set }: Context) => {
     }
 
     try {
+        /*
+          หน่วยที่รวมหลายหอ (เช่น Nursery + NICU) เป็นทีมเดียว จัดเวรรวมกัน
+          คนและโควตาที่ตั้งไว้ที่หอไหนในหน่วยก็ใช้ร่วมกัน (โควตาสองหอรวมกันเป็นของทั้งทีม)
+          และเวรที่ลงไว้แล้วที่หอไหนในหน่วยก็ถือว่าล็อก ไม่จัดซ้อนให้คนเดิม
+        */
+        const codes = (await wardGroupOf(wardCode))?.codes ?? [wardCode];
+        const numerics = codes.map(Number);
+
         const [staffRows, quotaRows, existingRows, shiftTypeRows, holidayRows] = await Promise.all([
             nurse`
-                SELECT s.staff_id, s.fullname, s.staff_position_id, sp.code
+                SELECT DISTINCT s.staff_id, s.fullname, s.staff_position_id, sp.code
                 FROM ward_staffs ws
                 JOIN staffs s ON s.staff_id = ws.staff_id
                 LEFT JOIN staff_position sp ON sp.staff_position_id = s.staff_position_id
-                WHERE ws.ward = ${wardNumeric} AND s.is_active = 'Y'
+                WHERE ws.ward IN ${nurse(numerics)} AND s.is_active = 'Y'
                 ORDER BY s.staff_id
             `,
             nurse`
-                SELECT staff_position_id, shift_code, quota
-                FROM ward_shift_quotas WHERE ward = ${wardNumeric}
+                SELECT staff_position_id, shift_code, SUM(quota)::int AS quota
+                FROM ward_shift_quotas WHERE ward IN ${nurse(numerics)}
+                GROUP BY staff_position_id, shift_code
             `,
             nurse`
                 SELECT staff_id, to_char(shift_date, 'YYYY-MM-DD') AS d, shift_code
                 FROM nurse_shift_assignments
-                WHERE ward = ${wardCode}
+                WHERE ward IN ${nurse(codes)}
                   AND shift_date >= ${dateOf(1)}::date
                   AND shift_date <= ${dateOf(daysInMonth)}::date
             `,

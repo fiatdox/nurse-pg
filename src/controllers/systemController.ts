@@ -1,8 +1,24 @@
 import { Context } from 'elysia';
 import { nurse } from '../db';
 import { sanitizeHTML } from '../utils/sanitize';
+import { wardUnits, groupInfo } from '../utils/wardGroup';
 
 
+
+/**
+ * หอผู้ป่วยแบบนับเป็นหน่วย — หอที่ใช้พยาบาลทีมเดียวกัน (ward.fte_group) รวมเป็นตัวเลือกเดียว
+ * ใช้กับหน้าที่ทำงานกับ "ทีมพยาบาล" เช่นจัดตารางเวร ไม่ใช่หน้าที่ลงข้อมูลผู้ป่วยตามห้องจริง
+ */
+export const getWardUnits = async ({ set }: Context) => {
+    try {
+        const units = (await wardUnits(null)).map(groupInfo);
+        return { success: true, data: units.sort((a, b) => (a.label ?? '').localeCompare(b.label ?? '', 'th')) };
+    } catch (error) {
+        console.error('Get ward units error:', error);
+        set.status = 500;
+        return { success: false, message: 'Internal Server Error' };
+    }
+};
 
 // ฟังก์ชั่นแสดงรายชื่อหอผู้ป่วย
 export const getWardsV1 = async ({ set }: Context) => {

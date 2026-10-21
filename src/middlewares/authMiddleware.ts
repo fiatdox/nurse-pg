@@ -50,12 +50,11 @@ export const authMiddleware = (app: Elysia) =>
           ถ้าไม่คัดชนิดตรงนี้ มันจะผ่านทุก route ที่ใช้ middleware ตัวนี้
           ซึ่งรวมถึงรายชื่อผู้ป่วย ผล lab และบันทึกทางการพยาบาล
 
-          เขียนเป็น "ปฏิเสธ vendor" ไม่ใช่ "อนุญาตเฉพาะ staff" เพราะ token
-          ของเจ้าหน้าที่ที่ออกไปก่อนหน้านี้ยังไม่มีฟิลด์ typ ถ้าเขียนแบบหลัง
-          ทุกคนจะหลุดออกจากระบบทันทีที่ deploy — token มีอายุ 8 ชม.
-          พ้นวันเดียวแล้วค่อยเปลี่ยนเป็น allow-list ซึ่งปลอดภัยกว่าในระยะยาว
+          รับเฉพาะ typ = staff (allow-list) ไม่ใช่ "ปฏิเสธ vendor"
+          token ชนิดใหม่ที่เพิ่มในอนาคต (เช่นขั้นกลางของการเข้าระบบ) จะถูกปฏิเสธเองโดยไม่ต้องจำมาแก้ที่นี่
+          token เจ้าหน้าที่มี typ ตั้งแต่ ก.ย. 2569 และอายุ 8 ชม. รุ่นที่ไม่มี typ หมดอายุไปนานแล้ว
         */
-        if (!user || (user as { typ?: string }).typ === VENDOR_TOKEN) {
+        if (!user || (user as { typ?: string }).typ !== STAFF_TOKEN) {
             set.status = 401;
             return { success: false, message: 'Unauthorized' };
         }

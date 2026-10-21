@@ -49,6 +49,10 @@ export const staffRoutes = new Elysia({ prefix: '/api/v1/staffs' })
     .get('/ward-staffs/:id', getWardStaffByWard, {
         params: t.Object({
             id: t.String()
+        }),
+        // unit=1 = รวมคนของทุกหอในหน่วยเดียวกัน (ใช้ตอนจัดตารางเวร)
+        query: t.Object({
+            unit: t.Optional(t.String())
         })
     })
 

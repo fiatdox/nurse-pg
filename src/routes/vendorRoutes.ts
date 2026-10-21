@@ -1,7 +1,9 @@
 import { Elysia, t } from 'elysia';
 import { jwt } from '@elysiajs/jwt';
 import { vendorMiddleware } from '../middlewares/vendorMiddleware';
-import { vendorLogin, vendorProfile } from '../controllers/vendorAuthController';
+import {
+    vendorLogin, vendorSetPassword, vendorOtpSend, vendorOtpVerify, vendorProfile, vendorLogout,
+} from '../controllers/vendorAuthController';
 import { vendorSummary, vendorDaily, vendorContracts } from '../controllers/vendorReportController';
 import {
     vendorFoodSummary, vendorWardSummary, vendorTrayLabels, vendorWards,
@@ -34,7 +36,29 @@ export const vendorRoutes = new Elysia({ prefix: '/api/v1/vendor' })
             username: t.String({ minLength: 1, maxLength: 64 }),
             password: t.String({ minLength: 1, maxLength: 200 })
         }),
-        detail: { summary: 'เข้าระบบสำหรับบริษัทผู้รับจ้างทำอาหาร', security: [] }
+        detail: { summary: 'เข้าระบบขั้นที่ 1 ชื่อผู้ใช้ + รหัสผ่าน ได้ pending_token', security: [] }
+    })
+    /*
+      ขั้นกลางของการเข้าระบบ รับ pending_token ทาง body ไม่ใช่ Authorization
+      token ขั้นกลางจึงไม่มีทางถูกส่งไปที่ route อื่นโดยเผลอ และ middleware ไม่ต้องรู้จักมัน
+    */
+    .post('/login/password', vendorSetPassword, {
+        body: t.Object({
+            pending_token: t.String({ minLength: 1, maxLength: 2000 }),
+            new_password: t.String({ minLength: 1, maxLength: 200 }),
+        }),
+        detail: { summary: 'เข้าระบบขั้นที่ 2 ตั้งรหัสผ่านเอง (ครั้งแรก หรือหลังได้รหัสชั่วคราว)', security: [] }
+    })
+    .post('/login/otp/send', vendorOtpSend, {
+        body: t.Object({ pending_token: t.String({ minLength: 1, maxLength: 2000 }) }),
+        detail: { summary: 'เข้าระบบขั้นที่ 3 ส่ง OTP ไปที่ LINE OA หมอพร้อม ของเจ้าของเลขบัตร', security: [] }
+    })
+    .post('/login/otp', vendorOtpVerify, {
+        body: t.Object({
+            pending_token: t.String({ minLength: 1, maxLength: 2000 }),
+            code: t.String({ minLength: 6, maxLength: 6 }),
+        }),
+        detail: { summary: 'เข้าระบบขั้นสุดท้าย OTP 6 หลัก ได้ token พร้อม session ใหม่', security: [] }
     })
 
     /*
@@ -45,6 +69,9 @@ export const vendorRoutes = new Elysia({ prefix: '/api/v1/vendor' })
     .use(vendorMiddleware)
     .get('/me', vendorProfile, {
         detail: { summary: 'ข้อมูลบัญชีบริษัทที่กำลังเข้าระบบอยู่' }
+    })
+    .post('/logout', vendorLogout, {
+        detail: { summary: 'ออกจากระบบ ปิด session ฝั่งเซิร์ฟเวอร์' }
     })
     /*
       เมนูที่ผู้ดูแลระบบเปิด/ปิดให้กลุ่มบริษัท
