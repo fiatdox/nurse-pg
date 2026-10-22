@@ -16,6 +16,7 @@ import { focusTemplateRoutes } from "./routes/focusTemplateRoutes";
 import { positionRoutes } from "./routes/positionRoutes";
 import { rateRoutes } from "./routes/rateRoutes";
 import { wardQuotaRoutes } from "./routes/wardQuotaRoutes";
+import { workUnitRoutes } from "./routes/workUnitRoutes";
 import { holidayRoutes } from "./routes/holidayRoutes";
 import { vendorRoutes } from "./routes/vendorRoutes";
 import { rxOrderRoutes } from "./routes/rxOrderRoutes";
@@ -32,7 +33,7 @@ const app = new Elysia()
       path: "/docs",
       documentation: {
         info: {
-          title: "Nurse PG API",
+          title: "PYHOS x NIS API",
           version: "1.0.50",
         },
         tags: [
@@ -78,6 +79,7 @@ const app = new Elysia()
   .use(positionRoutes)
   .use(rateRoutes)
   .use(wardQuotaRoutes)
+  .use(workUnitRoutes)
   .use(holidayRoutes)
   .use(rxOrderRoutes)
   .use(vendorRoutes)
