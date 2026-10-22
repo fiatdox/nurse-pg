@@ -1,6 +1,7 @@
-import { nurse, core_kon } from '../db';
+import { nurse } from '../db';
 import { sanitizeHTML } from '../utils/sanitize';
 import { wardGroupOf, groupInfo } from '../utils/wardGroup';
+import { workdaysBetween, monthBounds } from '../utils/workdays';
 import {
     HOURS_PER_SHIFT, MONTHLY_FTE_WEIGHT, MONTHLY_PRODUCT_WEIGHT, FTE_HEADCOUNT_HOURS,
     emptyStaff, addStaff, regularCount, totalCount, round2, pct,
@@ -272,36 +273,8 @@ export const getFTEByWard = async (
               AND a.shift_date >= DATE_TRUNC('month', (${month} || '-01')::date)
               AND a.shift_date <  DATE_TRUNC('month', (${month} || '-01')::date) + INTERVAL '1 month'`;
 
-        /*
-          วันราชการในเดือน = วันทั้งหมด − เสาร์อาทิตย์ − วันหยุดที่ประกาศ
-
-          วันหยุดที่ตรงกับเสาร์อาทิตย์อยู่แล้วต้องไม่ถูกหักซ้ำ จึงกรองด้วย DOW ในคิวรีเดียวกัน
-        */
-        const [firstDay] = await nurse`
-            SELECT TO_CHAR(DATE_TRUNC('month', (${month} || '-01')::date), 'YYYY-MM-DD') AS d1
-                 , TO_CHAR(DATE_TRUNC('month', (${month} || '-01')::date)
-                           + INTERVAL '1 month' - INTERVAL '1 day', 'YYYY-MM-DD') AS d2
-                 , COUNT(*) FILTER (WHERE EXTRACT(DOW FROM g) NOT IN (0, 6))::int AS weekdays
-            FROM generate_series(
-                DATE_TRUNC('month', (${month} || '-01')::date),
-                DATE_TRUNC('month', (${month} || '-01')::date) + INTERVAL '1 month' - INTERVAL '1 day',
-                INTERVAL '1 day') g`;
-
-        let publicHolidays = 0;
-        try {
-            const [h] = await core_kon`
-                SELECT COUNT(*)::int AS n
-                FROM core_kon.hr_holidays
-                WHERE is_active
-                  AND holiday_date BETWEEN ${firstDay.d1}::date AND ${firstDay.d2}::date
-                  AND EXTRACT(DOW FROM holiday_date) NOT IN (0, 6)`;
-            publicHolidays = Number(h?.n ?? 0);
-        } catch (error) {
-            // ฐานบุคลากรล่มไม่ควรทำให้ทั้งรายงานพัง ถือว่าไม่มีวันหยุดพิเศษแล้วไปต่อ
-            console.error('FTE: read holidays failed', error);
-        }
-
-        const workdays = Math.max(Number(firstDay.weekdays) - publicHolidays, 0);
+        const bounds = monthBounds(month);
+        const { workdays, public_holidays: publicHolidays } = await workdaysBetween(bounds.first, bounds.last);
 
         /*
           จำนวนพยาบาลตาม FTE (C6) — ตามไฟล์ต้นฉบับซึ่งใช้ตัวคูณ 12 กับผู้ป่วยทั้งสองกลุ่ม

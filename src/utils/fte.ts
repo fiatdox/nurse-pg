@@ -81,13 +81,20 @@ export interface Params {
 export const workload = (ptGeneral: number, ptCrisis: number, p: Params) =>
     p.general * ptGeneral + p.crisis * ptCrisis;
 
+/** FTE จากชั่วโมงภาระงาน = ชั่วโมง × สัดส่วนของเวร ÷ ชั่วโมงต่อเวร — weight 1 คือไม่ถ่วง */
+export const fteOfHours = (hours: number, weight: number) => (hours * weight) / HOURS_PER_SHIFT;
+
+/** product จากชั่วโมงภาระงาน เทียบกับชั่วโมงของคนที่ขึ้นจริง (รวม OT) คิดเป็นสัดส่วน */
+export const productOfHours = (hours: number, weight: number, staffCount: number) =>
+    safeDiv(hours * weight, staffCount * HOURS_PER_SHIFT);
+
 /** FTE = ภาระงาน × สัดส่วนของเวรนั้น ÷ ชั่วโมงต่อเวร (คอลัมน์ E) */
 export const fteOf = (ptGeneral: number, ptCrisis: number, weight: number, p: Params) =>
-    (workload(ptGeneral, ptCrisis, p) * weight) / HOURS_PER_SHIFT;
+    fteOfHours(workload(ptGeneral, ptCrisis, p), weight);
 
 /** product = ภาระงานที่ต้องการ เทียบกับกำลังที่ใส่ลงไปจริง คิดเป็นร้อยละ (คอลัมน์ N) */
 export const productOf = (ptGeneral: number, ptCrisis: number, weight: number, staff: ShiftStaff, p: Params) =>
-    safeDiv(workload(ptGeneral, ptCrisis, p) * weight, totalCount(staff) * HOURS_PER_SHIFT);
+    productOfHours(workload(ptGeneral, ptCrisis, p), weight, totalCount(staff));
 
 /** ชั่วโมงการพยาบาลต่อเวรตามประเภทผู้ป่วย 1-5 — ตัวตั้งของ product ตามประเภท */
 export const typeWorkload = (types: number[], p: Params) =>
@@ -96,4 +103,21 @@ export const typeWorkload = (types: number[], p: Params) =>
 /** product ที่คิดจากประเภทผู้ป่วย 1-5 แทนจำนวนหัว (คอลัมน์ U) */
 export const productByTypeOf = (types: number[], staff: ShiftStaff, p: Params) =>
     safeDiv(typeWorkload(types, p), totalCount(staff) * HOURS_PER_SHIFT);
+
+/*
+  ───── หน่วยงานที่ไม่ใช่หอผู้ป่วย (ER · ห้องผ่าตัด · วิสัญญี · ห้องคลอด · OPD) ─────
+
+  ไฟล์ของแต่ละงานเขียนสูตรต่างกันที่หน้าตา แต่แกะออกมาแล้วเป็นรูปเดียวกันหมด
+      ER        H9  = (R×3.2 + E×2.5 + U×1 + semi×0.5 + non×0.24) / 7
+      วิสัญญี    F9  = (3.7×(GA+MAC) + recovery×0.75) / 7
+      ห้องผ่าตัด E10 = 3.6×(major+minor) / 7
+      ห้องคลอด  F10 = (6×คลอดปกติ + 4.5×(C/S+แทรกซ้อน)) × สัดส่วนเวร / 7
+      OPD       G4  = (visit×0.2) / 7
+  คือ Σ(จำนวนราย × ชั่วโมงต่อราย) แล้วเข้า fteOfHours / productOfHours ตัวเดียวกับหอผู้ป่วย
+  ชั่วโมงต่อรายอยู่ในตาราง work_unit_items ไม่ได้ฝังไว้ที่นี่
+*/
+
+/** ภาระงานเป็นชั่วโมงการพยาบาล = Σ จำนวนราย × ชั่วโมงต่อราย */
+export const itemHours = (qty: number[], hours: number[]) =>
+    qty.reduce((sum, q, i) => sum + q * (hours[i] ?? 0), 0);
 
