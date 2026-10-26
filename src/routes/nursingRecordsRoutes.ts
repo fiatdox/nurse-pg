@@ -43,6 +43,25 @@ import {
     getFocusIndicators,
 } from '../controllers/focusRecordController';
 
+import {
+    getMarCodes, getMarOrders, createMarOrder, updateMarOrder, verifyMarOrder, discontinueMarOrder, deleteMarOrder,
+    getMarAdmins, getMarSchedule, saveMarAdmin, reassessMarAdmin, deleteMarAdmin, getMarAnalytics,
+} from '../controllers/marController';
+
+const MAR_ORDER_BODY = t.Object({
+    an: t.String(), hn: t.Optional(t.String()), ward_code: t.String(), ward_name: t.Optional(t.String()),
+    medication_name: t.String({ maxLength: 200 }), generic_name: t.Optional(t.String({ maxLength: 200 })),
+    dose_value: t.Number(), dose_unit: t.String({ maxLength: 20 }), route: t.String(),
+    frequency_code: t.String(), schedule_times: t.Optional(t.Union([t.Array(t.String(), { maxItems: 12 }), t.Null()])),
+    start_datetime: t.String(), end_date: t.Optional(t.Union([t.String(), t.Null()])),
+    prn_reason: t.Optional(t.String({ maxLength: 200 })),
+    prn_min_interval_hours: t.Optional(t.Union([t.Number(), t.Null()])),
+    prn_max_per_day: t.Optional(t.Union([t.Number(), t.Null()])),
+    time_critical: t.Optional(t.Boolean()), high_alert: t.Optional(t.Boolean()),
+    drug_class: t.Optional(t.String()), doctor_name: t.Optional(t.String({ maxLength: 100 })),
+    note: t.Optional(t.String({ maxLength: 500 })),
+});
+
 export const nursingRecordsRoutes = new Elysia({ prefix: '/api/v1/nursing-records' })
     .use(authMiddleware)
     .guard({ detail: { tags: ['Nursing Records'] } })
@@ -84,6 +103,82 @@ export const nursingRecordsRoutes = new Elysia({ prefix: '/api/v1/nursing-record
     .delete('/vital/:id', deleteVitalRecord, {
         params: t.Object({ id: t.String() }),
         detail: { summary: 'ลบสัญญาณชีพ (soft delete)' },
+    })
+
+    // ---------- บันทึกการให้ยา (MAR) ----------
+    // ผู้บันทึก ผู้ตรวจทาน ผู้ตรวจซ้ำ มาจากบัญชีที่เข้าสู่ระบบ ไม่รับชื่อจาก client
+    .get('/mar/codes', getMarCodes, {
+        detail: { summary: 'รหัสทางให้ยา ความถี่ กลุ่มยา เหตุผลงดยา ที่ server ใช้ตรวจ' },
+    })
+    .get('/mar/orders/:an', getMarOrders, {
+        params: t.Object({ an: t.String() }),
+        detail: { summary: 'คำสั่งยาของผู้ป่วย (คำสั่งที่ยังใช้อยู่ก่อน)' },
+    })
+    .post('/mar/orders', createMarOrder, {
+        body: MAR_ORDER_BODY,
+        detail: { summary: 'บันทึกคำสั่งยาที่คัดลอกจากคำสั่งแพทย์ (รอพยาบาลอีกคนตรวจทาน)' },
+    })
+    .put('/mar/orders/:id', updateMarOrder, {
+        params: t.Object({ id: t.String() }),
+        body: MAR_ORDER_BODY,
+        detail: { summary: 'แก้คำสั่งยา — เฉพาะที่ยังไม่ตรวจทานและยังไม่หยุดยา' },
+    })
+    .post('/mar/orders/:id/verify', verifyMarOrder, {
+        params: t.Object({ id: t.String() }),
+        detail: { summary: 'ตรวจทานคำสั่งยา (พยาบาลวิชาชีพ คนละคนกับผู้คัดลอก)' },
+    })
+    .post('/mar/orders/:id/discontinue', discontinueMarOrder, {
+        params: t.Object({ id: t.String() }),
+        body: t.Object({ reason: t.String({ maxLength: 300 }), at: t.Optional(t.String()) }),
+        detail: { summary: 'หยุดยา — มื้อหลังเวลาหยุดไม่นับว่าควรให้' },
+    })
+    .delete('/mar/orders/:id', deleteMarOrder, {
+        params: t.Object({ id: t.String() }),
+        body: t.Object({ reason: t.String({ maxLength: 300 }) }),
+        detail: { summary: 'ลบคำสั่งที่บันทึกผิด (เฉพาะที่ยังไม่มีการให้ยา)' },
+    })
+    .get('/mar/admins/:an', getMarAdmins, {
+        params: t.Object({ an: t.String() }),
+        query: t.Object({ limit: t.Optional(t.String()) }),
+        detail: { summary: 'ประวัติการให้ยาของผู้ป่วย (ใหม่สุดก่อน)' },
+    })
+    .get('/mar/schedule/:an', getMarSchedule, {
+        params: t.Object({ an: t.String() }),
+        query: t.Object({ date: t.Optional(t.String()) }),
+        detail: { summary: 'มื้อยาของผู้ป่วยหนึ่งวันพร้อมสถานะ (ตรงเวลา / ช้า / ขาด / ถึงเวลา)' },
+    })
+    .post('/mar/admin', saveMarAdmin, {
+        body: t.Object({
+            order_id: t.Number(), an: t.String(), ward_code: t.String(), ward_name: t.Optional(t.String()),
+            scheduled_at: t.Optional(t.Union([t.String(), t.Null()])), admin_datetime: t.Optional(t.String()),
+            dose_value: t.Optional(t.Union([t.Number(), t.Null()])), route: t.Optional(t.String()),
+            site: t.Optional(t.String({ maxLength: 50 })), status: t.String(),
+            reason_code: t.Optional(t.Union([t.String(), t.Null()])), held_reason: t.Optional(t.String({ maxLength: 500 })),
+            double_checked_by: t.Optional(t.Union([t.String({ maxLength: 20 }), t.Null()])),
+            prn_indication: t.Optional(t.String({ maxLength: 200 })),
+            pre_score: t.Optional(t.Union([t.Number(), t.Null()])), post_score: t.Optional(t.Union([t.Number(), t.Null()])),
+            reassessed_at: t.Optional(t.Union([t.String(), t.Null()])),
+            adverse_reaction: t.Optional(t.Boolean()), adverse_note: t.Optional(t.String({ maxLength: 500 })),
+            note: t.Optional(t.String({ maxLength: 500 })),
+        }),
+        detail: { summary: 'บันทึกการให้ยา / ไม่ได้ให้ยา หนึ่งมื้อ (ยาความเสี่ยงสูงต้องมีผู้ตรวจซ้ำ)' },
+    })
+    .post('/mar/admin/:id/reassess', reassessMarAdmin, {
+        params: t.Object({ id: t.String() }),
+        body: t.Object({ post_score: t.Number(), reassessed_at: t.Optional(t.String()) }),
+        detail: { summary: 'ประเมินผลหลังให้ยา PRN' },
+    })
+    .delete('/mar/admin/:id', deleteMarAdmin, {
+        params: t.Object({ id: t.String() }),
+        body: t.Object({ reason: t.String({ maxLength: 300 }) }),
+        detail: { summary: 'ลบบันทึกการให้ยาที่ผิด (soft delete พร้อมเหตุผล)' },
+    })
+    .post('/mar/analytics', getMarAnalytics, {
+        body: t.Object({
+            date_from: t.String(), date_to: t.String(),
+            wards: t.Optional(t.Array(t.String(), { maxItems: 100 })),
+        }),
+        detail: { summary: 'ตัวชี้วัดการบริหารยา: ตรงเวลา ขาดมื้อ เหตุผลงดยา ยาความเสี่ยงสูง PRN การตรวจทานคำสั่ง' },
     })
 
     // ---------- แบบประเมินความปวด ----------
