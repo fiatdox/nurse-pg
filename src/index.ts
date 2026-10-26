@@ -1,5 +1,5 @@
 import { Elysia } from "elysia";
-import { swagger } from "@elysiajs/swagger";
+import { openapi } from "@elysiajs/openapi";
 import { corsMiddleware } from "./middlewares/corsMiddleware";
 import { securityMiddleware } from "./middlewares/securityMiddleware";
 import { loggerMiddleware } from "./middlewares/loggerMiddleware";
@@ -29,7 +29,7 @@ const app = new Elysia()
   .use(securityMiddleware)
   .use(loggerMiddleware)
   .use(
-    swagger({
+    openapi({
       path: "/docs",
       documentation: {
         info: {
