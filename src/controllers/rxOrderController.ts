@@ -10,6 +10,7 @@ import { padHn, HN_LENGTH } from '../utils/hn';
 import { admissionsOf, hisWardCode } from './rxHnReaderController';
 import { retentionDays } from './rxRetentionController';
 import { emitRxOrder, type RxStatus } from '../realtime';
+import { isAdmin } from './systemSettingsController';
 
 /**
  * ระบบส่งใบสั่งยาจากหอผู้ป่วยไปห้องยา
@@ -490,7 +491,9 @@ export const getRxOrder = async ({ params, user, set }: Context & { user?: unkno
             FROM rx_order_files WHERE rx_order_id = ${id} ORDER BY file_no
         `;
         const events = await nurse`
-            SELECT action, actor_name, TO_CHAR(at, 'DD/MM/YYYY HH24:MI') AS at, detail
+            SELECT action, actor_name, TO_CHAR(at, 'DD/MM/YYYY HH24:MI') AS at,
+                   /* logEvent เก็บเป็นสตริง JSON ซ้อนใน jsonb แกะออกให้หน้าจอได้อ็อบเจ็กต์ */
+                   CASE WHEN jsonb_typeof(detail) = 'string' THEN (detail #>> '{}')::jsonb ELSE detail END AS detail
             FROM rx_order_events WHERE rx_order_id = ${id} ORDER BY at
         `;
 
@@ -772,5 +775,244 @@ export const rejectRxOrder = async ({ params, body, user, set }: Context & { use
         console.error('Reject rx order error:', error);
         set.status = 500;
         return { success: false, message: 'ส่งกลับไม่สำเร็จ' };
+    }
+};
+
+/* ───────────────────────── หอแก้ HN หลังส่ง ───────────────────────── */
+
+/** สถานะที่หอยังแก้ HN ได้ — ใบที่ส่งกลับให้ส่งฉบับแก้ ใบที่รับยาไปแล้วหรือปิดแล้วจบไปแล้ว */
+const HN_EDITABLE: RxStatus[] = ['submitted', 'acknowledged', 'completed', 'prepared'];
+
+/**
+ * หอแก้ HN ของใบที่ส่งไปแล้ว (ลืมใส่ หรือใส่ผิดคน)
+ *
+ * บังคับหมายเหตุ เพราะห้องยาอาจคีย์ลง HIS ไปแล้วในชื่อคนเดิม ต้องรู้ว่าทำไมเปลี่ยนถึงจะไปตามแก้ได้
+ * HIS ล่มยังแก้ได้เหมือนตอนส่งใบ (his_verified = false) แต่ถ้า HIS ตอบว่าไม่มี HN นี้ ปฏิเสธ
+ * สัญญาณที่ส่งไปไม่มี HN หรือชื่อ ห้องยาไปดึงจาก REST เองเหมือนสัญญาณอื่น
+ */
+export const editRxOrderHn = async ({ params, body, user, set }: Context & { user?: unknown }) => {
+    const actor = await getActor(user);
+    if (!actor) return unauthorized(set);
+
+    const id = Number((params as { id?: string }).id);
+    if (!Number.isInteger(id)) { set.status = 400; return { success: false, message: 'เลขที่ไม่ถูกต้อง' }; }
+
+    const b = (body ?? {}) as { hn?: string; note?: string };
+    const hn = padHn(String(b.hn ?? '').replace(/\D/g, ''));
+    if (!new RegExp(`^\\d{${HN_LENGTH}}$`).test(hn) || /^0+$/.test(hn)) {
+        set.status = 400;
+        return { success: false, message: `HN ต้องเป็นตัวเลขไม่เกิน ${HN_LENGTH} หลัก` };
+    }
+    const note = (sanitizeHTML(String(b.note ?? '').trim()) ?? '').slice(0, 300);
+    if (note.length < 3) {
+        set.status = 400;
+        return { success: false, message: 'กรุณาระบุหมายเหตุว่าแก้ HN เพราะอะไร' };
+    }
+
+    const cur = await nurse`
+        SELECT hn, status, TO_CHAR(submitted_at, 'YYYY-MM-DD') AS day FROM rx_orders WHERE rx_order_id = ${id}
+    `;
+    if (cur.length === 0) { set.status = 404; return { success: false, message: 'ไม่พบใบสั่งยานี้' }; }
+    const oldHn = String(cur[0].hn ?? '').trim();
+    if (!HN_EDITABLE.includes(String(cur[0].status) as RxStatus)) {
+        set.status = 409;
+        return { success: false, message: 'ใบนี้แก้ HN ไม่ได้แล้ว (ส่งกลับ รับยาไปแล้ว หรือปิดเรื่องแล้ว)' };
+    }
+    if (oldHn === hn) {
+        set.status = 400;
+        return { success: false, message: 'HN เดิมกับ HN ใหม่เป็นเลขเดียวกัน' };
+    }
+
+    /* AN ของการนอนที่ครอบวันที่ส่งใบ HN เปลี่ยน = AN เดิมใช้ไม่ได้แล้ว จึงแทนที่เสมอ */
+    let patientName: string | null = null;
+    let an: string | null = null;
+    let hisVerified = false;
+    try {
+        const [[p], [a]] = await Promise.all([
+            his.execute<RowDataPacket[]>(
+                `SELECT CONCAT(pname, fname, ' ', lname) AS ptname FROM patient WHERE hn = ? LIMIT 1`, [hn]),
+            his.execute<RowDataPacket[]>(
+                `SELECT an FROM ipt WHERE hn = ? AND regdate <= ? AND (dchdate IS NULL OR dchdate >= ?)
+                 ORDER BY regdate DESC, regtime DESC LIMIT 1`, [hn, cur[0].day, cur[0].day]),
+        ]);
+        if (!p[0]) {
+            set.status = 404;
+            return { success: false, message: `ไม่พบ HN ${hn} ใน HIS` };
+        }
+        patientName = (sanitizeHTML(String(p[0].ptname ?? '')) ?? '').trim() || null;
+        an = a[0]?.an ? String(a[0].an) : null;
+        hisVerified = true;
+    } catch (error) {
+        // HIS ล่มไม่ใช่เหตุให้แก้ไม่ได้ ห้องยาจะเห็นป้าย "ยังไม่ได้ยืนยันกับ HIS"
+        console.error('HIS verify on edit hn failed:', error);
+    }
+
+    try {
+        /* เงื่อนไข HN เดิมกับสถานะอยู่ใน WHERE กันอีกเครื่องแก้หรือเปลี่ยนสถานะไปก่อนระหว่างตรวจ HIS */
+        const rows = await nurse`
+            UPDATE rx_orders
+            SET hn = ${hn}, an = ${an}, patient_name = ${patientName},
+                his_verified = ${hisVerified}, hn_source = 'manual'
+            WHERE rx_order_id = ${id}
+              AND COALESCE(btrim(hn), '') = ${oldHn}
+              AND status IN ${nurse(HN_EDITABLE)}
+            RETURNING ward, priority, status
+        `;
+        if (rows.length === 0) {
+            set.status = 409;
+            return { success: false, message: 'ใบนี้ถูกแก้หรือเปลี่ยนสถานะไปก่อนแล้ว กรุณาเปิดดูใหม่' };
+        }
+        await logEvent(id, 'edit_hn', actor, { from: oldHn || null, to: hn, note });
+        emitRxOrder('order:hn', {
+            rx_order_id: String(id),
+            ward: Number(rows[0].ward),
+            status: String(rows[0].status) as RxStatus,
+            priority: String(rows[0].priority) as 'routine' | 'discharge' | 'stat',
+            by_name: actor.fullname,
+            at: new Date().toISOString(),
+            reason: note,
+        });
+        return {
+            success: true,
+            data: { rx_order_id: id, hn, an, patient_name: patientName, his_verified: hisVerified },
+        };
+    } catch (error) {
+        console.error('Edit rx hn error:', error);
+        set.status = 500;
+        return { success: false, message: 'แก้ HN ไม่สำเร็จ' };
+    }
+};
+
+/* ───────────────────────── แอดมิน: ใส่ HN ย้อนหลัง ───────────────────────── */
+
+const forbidden = (set: Context['set']) => {
+    set.status = 403;
+    return { success: false, message: 'เฉพาะผู้ดูแลระบบ' };
+};
+
+/**
+ * ใบที่ส่งมาโดยไม่มี HN
+ *
+ * มาจากช่วงก่อนที่หน้าจอและเซิร์ฟเวอร์จะบังคับใส่ HN ทุกใบ
+ * ใบพวกนี้ค้นด้วย HN ไม่เจอ และห้องยาต้องอ่านเลขจากภาพเอง จึงให้แอดมินดูภาพแล้วใส่ให้
+ */
+export const listRxMissingHn = async ({ user, set }: Context & { user?: unknown }) => {
+    const actor = await getActor(user);
+    if (!actor) return unauthorized(set);
+    if (!(await isAdmin(actor.username))) return forbidden(set);
+
+    try {
+        const rows = await nurse`
+            SELECT o.rx_order_id::int AS rx_order_id, o.ward, w.ward_name, o.status, o.priority, o.note,
+                   o.submitted_by_name,
+                   TO_CHAR(o.submitted_at, 'YYYY-MM-DD HH24:MI') AS submitted_at_text,
+                   COALESCE((
+                       SELECT json_agg(json_build_object(
+                                  'rx_file_id', f.rx_file_id, 'file_no', f.file_no,
+                                  'original_name', f.original_name, 'mime_type', f.mime_type,
+                                  'byte_size', f.byte_size,
+                                  'purged_at', TO_CHAR(f.purged_at, 'YYYY-MM-DD HH24:MI'))
+                              ORDER BY f.file_no)
+                       FROM rx_order_files f WHERE f.rx_order_id = o.rx_order_id
+                   ), '[]'::json) AS files
+            FROM rx_orders o
+            LEFT JOIN ward w ON w.ward = o.ward
+            WHERE o.hn IS NULL OR btrim(o.hn) = ''
+            ORDER BY o.submitted_at DESC
+        `;
+        return { success: true, data: rows, file_retention_days: await retentionDays() };
+    } catch (error) {
+        console.error('List rx missing hn error:', error);
+        set.status = 500;
+        return { success: false, message: 'ดึงรายการไม่สำเร็จ' };
+    }
+};
+
+/**
+ * แอดมินใส่ HN ให้ใบที่ไม่มี HN
+ *
+ * ต่างจากตอนหอส่งใบตรงที่ HIS ต้องยืนยันได้เท่านั้น ตอนส่งใบยอมให้ HIS ล่มได้เพราะยาต้องถึงผู้ป่วย
+ * แต่การใส่ย้อนหลังไม่มีอะไรเร่ง รอ HIS กลับมาได้ ไม่มีเหตุให้บันทึกเลขที่ไม่มีใครยืนยัน
+ * แก้ได้เฉพาะใบที่ยังไม่มี HN การเปลี่ยน HN ที่ใส่ไว้แล้วเป็นอีกเรื่องหนึ่ง ไม่ให้ทำผ่านทางนี้
+ */
+export const setRxOrderHn = async ({ params, body, user, set }: Context & { user?: unknown }) => {
+    const actor = await getActor(user);
+    if (!actor) return unauthorized(set);
+    if (!(await isAdmin(actor.username))) return forbidden(set);
+
+    const id = Number((params as { id?: string }).id);
+    if (!Number.isInteger(id)) { set.status = 400; return { success: false, message: 'เลขที่ไม่ถูกต้อง' }; }
+
+    const b = (body ?? {}) as { hn?: string; note?: string };
+    const hn = padHn(String(b.hn ?? '').replace(/\D/g, ''));
+    /* ศูนย์ล้วนผ่านรูปแบบเก้าหลักได้ แต่ไม่ใช่ HN ของใคร */
+    if (!new RegExp(`^\\d{${HN_LENGTH}}$`).test(hn) || /^0+$/.test(hn)) {
+        set.status = 400;
+        return { success: false, message: `HN ต้องเป็นตัวเลขไม่เกิน ${HN_LENGTH} หลัก` };
+    }
+    const note = (sanitizeHTML(String(b.note ?? '').trim()) ?? '').slice(0, 300);
+
+    const cur = await nurse`
+        SELECT hn, TO_CHAR(submitted_at, 'YYYY-MM-DD') AS day FROM rx_orders WHERE rx_order_id = ${id}
+    `;
+    if (cur.length === 0) { set.status = 404; return { success: false, message: 'ไม่พบใบสั่งยานี้' }; }
+    if (String(cur[0].hn ?? '').trim()) {
+        set.status = 409;
+        return { success: false, message: `ใบนี้มี HN แล้ว (${cur[0].hn})` };
+    }
+
+    /*
+      AN เอาเฉพาะการนอนที่ครอบวันที่ส่งใบ ไม่ใช่การนอนล่าสุด
+      ผู้ป่วยที่จำหน่ายแล้วกลับมานอนใหม่ ใบเก่าต้องผูกกับการนอนครั้งเก่า
+    */
+    let patientName = '';
+    let an: string | null = null;
+    try {
+        const [[p], [a]] = await Promise.all([
+            his.execute<RowDataPacket[]>(
+                `SELECT CONCAT(pname, fname, ' ', lname) AS ptname FROM patient WHERE hn = ? LIMIT 1`, [hn]),
+            his.execute<RowDataPacket[]>(
+                `SELECT an FROM ipt WHERE hn = ? AND regdate <= ? AND (dchdate IS NULL OR dchdate >= ?)
+                 ORDER BY regdate DESC, regtime DESC LIMIT 1`, [hn, cur[0].day, cur[0].day]),
+        ]);
+        if (!p[0]) {
+            set.status = 404;
+            return { success: false, message: `ไม่พบ HN ${hn} ใน HIS` };
+        }
+        patientName = (sanitizeHTML(String(p[0].ptname ?? '')) ?? '').trim();
+        an = a[0]?.an ? String(a[0].an) : null;
+    } catch (error) {
+        console.error('HIS verify on set hn failed:', error);
+        set.status = 503;
+        return { success: false, message: 'ตรวจกับ HIS ไม่ได้ตอนนี้ กรุณาลองใหม่ภายหลัง' };
+    }
+
+    try {
+        const rows = await nurse`
+            UPDATE rx_orders
+            SET hn = ${hn}, an = COALESCE(NULLIF(btrim(an), ''), ${an}),
+                patient_name = ${patientName}, his_verified = true, hn_source = 'manual'
+            WHERE rx_order_id = ${id} AND (hn IS NULL OR btrim(hn) = '')
+            RETURNING ward, priority, status, an
+        `;
+        /* อีกเครื่องใส่ไปก่อนระหว่างที่ตรวจ HIS อยู่ */
+        if (rows.length === 0) {
+            set.status = 409;
+            return { success: false, message: 'ใบนี้ถูกใส่ HN ไปแล้ว' };
+        }
+        await logEvent(id, 'set_hn', actor, { hn, ...(note ? { note } : {}) });
+        emitRxOrder('order:status', {
+            rx_order_id: String(id),
+            ward: Number(rows[0].ward),
+            status: String(rows[0].status) as RxStatus,
+            priority: String(rows[0].priority) as 'routine' | 'discharge' | 'stat',
+            by_name: actor.fullname,
+            at: new Date().toISOString(),
+        });
+        return { success: true, data: { rx_order_id: id, hn, an: rows[0].an ?? null, patient_name: patientName } };
+    } catch (error) {
+        console.error('Set rx hn error:', error);
+        set.status = 500;
+        return { success: false, message: 'บันทึก HN ไม่สำเร็จ' };
     }
 };

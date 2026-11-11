@@ -3,6 +3,7 @@ import { authMiddleware } from '../middlewares/authMiddleware';
 import {
     lookupRxPatient, createRxOrder, listRxOrders, getRxOrder, getRxOrderFile,
     ackRxOrder, completeRxOrder, prepareRxOrder, pickupRxOrder, closeRxOrder, rejectRxOrder,
+    listRxMissingHn, setRxOrderHn, editRxOrderHn,
 } from '../controllers/rxOrderController';
 import { readRxHn } from '../controllers/rxHnReaderController';
 import { getRxRetention } from '../controllers/rxRetentionController';
@@ -127,4 +128,18 @@ export const rxOrderRoutes = new Elysia({ prefix: '/api/v1/rx' })
     .post('/orders/:id/reject', rejectRxOrder, {
         body: t.Object({ reason: t.String() }),
         detail: { summary: 'ส่งใบกลับให้หอแก้ไข ต้องระบุเหตุผล' },
+    })
+
+    .post('/orders/:id/edit-hn', editRxOrderHn, {
+        body: t.Object({ hn: t.String(), note: t.String() }),
+        detail: { summary: 'หอแก้ HN ของใบที่ส่งแล้ว (ต้องมีหมายเหตุ · ห้องยาได้รับแจ้งเตือนทันที)' },
+    })
+
+    .get('/admin/missing-hn', listRxMissingHn, {
+        detail: { summary: 'แอดมิน: ใบที่ส่งมาโดยไม่มี HN พร้อมรายการไฟล์' },
+    })
+
+    .post('/orders/:id/hn', setRxOrderHn, {
+        body: t.Object({ hn: t.String(), note: t.Optional(t.String()) }),
+        detail: { summary: 'แอดมิน: ใส่ HN ให้ใบที่ไม่มี HN (ต้องยืนยันกับ HIS ได้ · แก้ HN ที่มีอยู่แล้วไม่ได้)' },
     });
