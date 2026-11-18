@@ -115,3 +115,69 @@ export const setAiSetting = async ({ body, set, user }: Context & { user: any })
         return { success: false, message: 'Internal Server Error' };
     }
 };
+
+// ---------- เครื่องมือ OCR ที่ใช้อ่าน HN จากภาพใบสั่งยา ----------
+
+export type OcrEngine = 'tesseract' | 'paddle';
+const OCR_ENGINES: OcrEngine[] = ['tesseract', 'paddle'];
+
+/** เครื่องมือ OCR ที่ตั้งไว้ — อ่านค่าไม่ได้ใช้ tesseract ซึ่งเป็นตัวเดิมที่ทดสอบกับใบจริงมาแล้ว */
+export const rxOcrEngine = async (): Promise<OcrEngine> => {
+    const v = await readSetting<{ engine?: string }>('rx_ocr_engine', { engine: 'tesseract' });
+    return OCR_ENGINES.includes(v?.engine as OcrEngine) ? (v.engine as OcrEngine) : 'tesseract';
+};
+
+export const getOcrSetting = async ({ set, user }: Context & { user: any }) => {
+    try {
+        const rows = await nurse`
+            SELECT value, updated_at, updated_by FROM system_settings WHERE key = 'rx_ocr_engine' LIMIT 1
+        `;
+        const row = rows[0] as Record<string, unknown> | undefined;
+        return {
+            success: true,
+            data: {
+                engine: await rxOcrEngine(),
+                updated_at: row?.updated_at ?? null,
+                updated_by: row?.updated_by ?? null,
+                can_manage: await isAdmin(user),
+            },
+        };
+    } catch (error) {
+        console.error('Get OCR setting error:', error);
+        set.status = 500;
+        return { success: false, message: 'Internal Server Error' };
+    }
+};
+
+export const setOcrSetting = async ({ body, set, user }: Context & { user: any }) => {
+    const engine = String((body as { engine?: unknown } | undefined)?.engine ?? '') as OcrEngine;
+    if (!OCR_ENGINES.includes(engine)) {
+        set.status = 400;
+        return { success: false, message: 'engine ต้องเป็น tesseract หรือ paddle' };
+    }
+    if (!(await isAdmin(user))) {
+        set.status = 403;
+        return { success: false, message: 'เฉพาะผู้ดูแลระบบเท่านั้นที่เปลี่ยนค่านี้ได้' };
+    }
+    const username = String((user as { username?: unknown })?.username ?? '');
+    try {
+        const saved = await nurse`
+            INSERT INTO system_settings (key, value, description, updated_at, updated_by)
+            VALUES ('rx_ocr_engine', ${nurse.json({ engine })},
+                    'เครื่องมือ OCR อ่าน HN จากภาพใบสั่งยา (tesseract / paddle)', ${new Date()}, ${username})
+            ON CONFLICT (key) DO UPDATE
+            SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by
+            RETURNING updated_at, updated_by
+        `;
+        const row = saved[0] as Record<string, unknown>;
+        return {
+            success: true,
+            message: engine === 'paddle' ? 'เปลี่ยนเป็น PaddleOCR แล้ว' : 'เปลี่ยนเป็น Tesseract แล้ว',
+            data: { engine, updated_at: row.updated_at, updated_by: row.updated_by, can_manage: true },
+        };
+    } catch (error) {
+        console.error('Set OCR setting error:', error);
+        set.status = 500;
+        return { success: false, message: 'Internal Server Error' };
+    }
+};

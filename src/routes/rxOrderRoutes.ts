@@ -5,9 +5,10 @@ import {
     ackRxOrder, completeRxOrder, prepareRxOrder, pickupRxOrder, closeRxOrder, rejectRxOrder,
     listRxMissingHn, setRxOrderHn, editRxOrderHn,
 } from '../controllers/rxOrderController';
-import { readRxHn } from '../controllers/rxHnReaderController';
+import { readRxHn, listWardPatients } from '../controllers/rxHnReaderController';
 import { getRxRetention } from '../controllers/rxRetentionController';
 import { getRxDashboard } from '../controllers/rxDashboardController';
+import { getRxRenal } from '../controllers/rxRenalController';
 
 /**
  * ใบสั่งยาจากหอผู้ป่วยถึงห้องยา
@@ -23,6 +24,11 @@ export const rxOrderRoutes = new Elysia({ prefix: '/api/v1/rx' })
     .get('/patient-lookup', lookupRxPatient, {
         query: t.Object({ hn: t.String(), ward: t.Optional(t.String()) }),
         detail: { summary: 'ค้นชื่อผู้ป่วยจาก HN เพื่อยืนยันก่อนส่งใบสั่งยา' },
+    })
+
+    .get('/ward-patients', listWardPatients, {
+        query: t.Object({ ward: t.String() }),
+        detail: { summary: 'ผู้ป่วยที่ส่งใบสั่งยาจากตึกนี้ได้ (นอนอยู่ หรือเพิ่งจำหน่ายจากตึกนี้) ให้เลือกแทนการพิมพ์ HN' },
     })
 
     .post('/read-hn', readRxHn, {
@@ -85,6 +91,10 @@ export const rxOrderRoutes = new Elysia({ prefix: '/api/v1/rx' })
 
     .get('/orders/:id', getRxOrder, {
         detail: { summary: 'รายละเอียดใบสั่งยา พร้อมรายการไฟล์และประวัติการดำเนินการ' },
+    })
+
+    .get('/orders/:id/renal', getRxRenal, {
+        detail: { summary: 'ค่าการทำงานของไตของผู้ป่วยในใบนี้ (Creatinine · eGFR CKD-EPI · CrCl Cockcroft-Gault) สูตรเดียวกับ DUE' },
     })
 
     .get('/orders/:id/files/:fileId', getRxOrderFile, {

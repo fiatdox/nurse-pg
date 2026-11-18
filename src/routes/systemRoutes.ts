@@ -1,6 +1,6 @@
 import { Elysia, t } from 'elysia';
 import { authMiddleware } from '../middlewares/authMiddleware';
-import { getAiSetting, setAiSetting } from '../controllers/systemSettingsController';
+import { getAiSetting, setAiSetting, getOcrSetting, setOcrSetting } from '../controllers/systemSettingsController';
 import {
     getMyMenuAccess, getMenuMatrix, saveMenuAccess, resetMenuAccess,
 } from '../controllers/menuAccessController';
@@ -36,6 +36,13 @@ export const systemRoutes = new Elysia({ prefix: '/api/v1/system' })
     .put('/ai-setting', setAiSetting, {
         body: t.Object({ enabled: t.Boolean() }),
         detail: { summary: 'เปิด/ปิดผู้ช่วย AI ทั้งระบบ (เฉพาะผู้ดูแลระบบ)' },
+    })
+    .get('/ocr-setting', getOcrSetting, {
+        detail: { summary: 'เครื่องมือ OCR ที่ใช้อ่าน HN จากภาพใบสั่งยา และผู้ใช้คนนี้แก้ได้หรือไม่' },
+    })
+    .put('/ocr-setting', setOcrSetting, {
+        body: t.Object({ engine: t.Union([t.Literal('tesseract'), t.Literal('paddle')]) }),
+        detail: { summary: 'เลือกเครื่องมือ OCR: tesseract / paddle (เฉพาะผู้ดูแลระบบ)' },
     })
 
     // ---------- การมองเห็นเมนูรายกลุ่ม ----------

@@ -63,6 +63,52 @@ const logEvent = async (
     `;
 };
 
+/* ───────────────────────── ตรวจว่าผู้ป่วยอยู่ตึกนี้ ───────────────────────── */
+
+type WardCheck =
+    | { ok: true; verified: true; ptname: string; an: string | null }
+    /* HIS ล่ม: ยอมให้ผ่านเหมือนเดิม ยาต้องถึงผู้ป่วย ห้องยาจะเห็นว่ายังไม่ได้ยืนยัน */
+    | { ok: true; verified: false; ptname: ''; an: null }
+    | { ok: false; status: number; message: string };
+
+/**
+ * HN นี้ส่งใบจากตึกนี้ได้ไหม
+ *
+ * พบว่ามีการใส่ HN มั่ว (เช่นศูนย์ล้วน หรือเลขของคนอื่น) เพื่อให้ผ่านช่องบังคับ HN
+ * จึงยอมรับเฉพาะผู้ป่วยที่นอนอยู่ตึกที่เลือก หรือเพิ่งจำหน่ายจากตึกนี้ (ยากลับบ้าน)
+ * HN ที่ไม่มีในทะเบียนเลย ไม่ได้นอน หรือนอนตึกอื่น ปฏิเสธทั้งหมด
+ */
+const checkPatientInWard = async (hn: string, ward: number): Promise<WardCheck> => {
+    if (/^0+$/.test(hn)) return { ok: false, status: 400, message: 'HN ไม่ถูกต้อง' };
+    const wardCode = await hisWardCode(ward);
+    if (!wardCode) {
+        return { ok: false, status: 400, message: 'ตึกนี้ยังไม่ได้ผูกรหัสตึกกับ HIS ตรวจผู้ป่วยไม่ได้ กรุณาแจ้งผู้ดูแลระบบ' };
+    }
+    let adm: Awaited<ReturnType<typeof admissionsOf>>;
+    let name: string | undefined;
+    try {
+        const [a, [rows]] = await Promise.all([
+            admissionsOf([hn], wardCode),
+            his.execute<RowDataPacket[]>(
+                `SELECT CONCAT(pname, fname, ' ', lname) AS ptname FROM patient WHERE hn = ? LIMIT 1`, [hn]),
+        ]);
+        adm = a;
+        name = rows[0] ? (sanitizeHTML(String(rows[0].ptname ?? '')) ?? '').trim() : undefined;
+    } catch (error) {
+        console.error('HIS ward check failed:', error);
+        return { ok: true, verified: false, ptname: '', an: null };
+    }
+    const a = adm.get(hn);
+    if (a?.in_ward) return { ok: true, verified: true, ptname: name ?? '', an: a.an };
+
+    const why = !a && name === undefined ? `ไม่พบ HN ${hn} ใน HIS`
+        : a?.admission === 'admitted' ? `HN ${hn} นอนอยู่ที่${a.ward_name ? ` ${a.ward_name}` : 'ตึกอื่น'} ไม่ใช่ตึกที่เลือก`
+        : a?.admission === 'admitted_here' ? `HN ${hn} ไม่ได้นอนอยู่ที่ตึกนี้`
+        : a?.admission === 'discharged' ? `HN ${hn} จำหน่ายแล้ว (${a.discharged_at ?? '-'}) หรือไม่ได้จำหน่ายจากตึกนี้`
+        : `HN ${hn} ไม่ได้นอนโรงพยาบาลอยู่`;
+    return { ok: false, status: 400, message: `${why} · ส่งได้เฉพาะผู้ป่วยที่นอนอยู่ตึกที่เลือกเท่านั้น` };
+};
+
 /* ───────────────────────── ฝั่งหอผู้ป่วย ───────────────────────── */
 
 /**
@@ -108,6 +154,7 @@ export const lookupRxPatient = async ({ query, set }: Context) => {
                 ward_name: a?.ward_name ?? null,
                 admission: a?.admission ?? 'none',
                 discharged_at: a?.discharged_at ?? null,
+                in_ward: a?.in_ward ?? false,
             },
         };
     } catch (error) {
@@ -182,7 +229,13 @@ export const createRxOrder = async ({ body, user, set }: Context & { user?: unkn
         set.status = 400;
         return { success: false, message: `กรุณาระบุ HN ของใบสั่งยา (ตัวเลขไม่เกิน ${HN_LENGTH} หลัก)` };
     }
-    const an = String(b.an ?? '').trim();
+    const check = await checkPatientInWard(hn, ward);
+    if (!check.ok) {
+        set.status = check.status;
+        return { success: false, message: check.message };
+    }
+    /* AN จาก HIS ชนะ AN ที่หน้าจอส่งมา ยกเว้นตอน HIS ล่มซึ่งไม่มีอะไรให้เทียบ */
+    const an = (check.verified ? check.an ?? '' : String(b.an ?? '')).trim();
     const hnSource = ['barcode', 'pdf_text', 'ocr', 'manual'].includes(String(b.hn_source))
         ? String(b.hn_source) : 'manual';
     /* ค่าที่ไม่รู้จักถือเป็นใบปกติ ไม่ใช่ปัดตก ใบต้องถึงห้องยาแม้หน้าจอส่งค่าแปลก ๆ มา */
@@ -195,23 +248,10 @@ export const createRxOrder = async ({ body, user, set }: Context & { user?: unkn
       ค้น HIS ซ้ำที่ฝั่งเซิร์ฟเวอร์ ไม่เชื่อชื่อผู้ป่วยที่ส่งมาจากหน้าเว็บ
       เพราะชื่อที่ติดไปกับใบสั่งยาคือสิ่งที่ห้องยาใช้ตรวจว่าจ่ายยาให้ถูกคน
     */
-    let patientName = String(b.patient_name ?? '').trim();
-    let hisVerified = false;
-    if (/^\d{1,20}$/.test(hn)) {
-        try {
-            const [rows] = await his.execute<RowDataPacket[]>(
-                `SELECT CONCAT(pname, fname, ' ', lname) AS ptname FROM patient WHERE hn = ? LIMIT 1`,
-                [hn],
-            );
-            if (rows[0]) {
-                patientName = (sanitizeHTML(String(rows[0].ptname ?? '')) ?? '').trim();
-                hisVerified = true;
-            }
-        } catch (error) {
-            // HIS ล่มไม่ใช่เหตุให้ยาไปไม่ถึงผู้ป่วย บันทึกไว้ว่ายืนยันไม่ได้แล้วไปต่อ
-            console.error('HIS verify on submit failed:', error);
-        }
-    }
+    const patientName = check.verified
+        ? check.ptname
+        : (sanitizeHTML(String(b.patient_name ?? '').trim()) ?? '').slice(0, 200);
+    const hisVerified = check.verified;
 
     /*
       ส่งซ้ำหลังถูกส่งกลับ
@@ -810,7 +850,7 @@ export const editRxOrderHn = async ({ params, body, user, set }: Context & { use
     }
 
     const cur = await nurse`
-        SELECT hn, status, TO_CHAR(submitted_at, 'YYYY-MM-DD') AS day FROM rx_orders WHERE rx_order_id = ${id}
+        SELECT hn, status, ward FROM rx_orders WHERE rx_order_id = ${id}
     `;
     if (cur.length === 0) { set.status = 404; return { success: false, message: 'ไม่พบใบสั่งยานี้' }; }
     const oldHn = String(cur[0].hn ?? '').trim();
@@ -823,29 +863,15 @@ export const editRxOrderHn = async ({ params, body, user, set }: Context & { use
         return { success: false, message: 'HN เดิมกับ HN ใหม่เป็นเลขเดียวกัน' };
     }
 
-    /* AN ของการนอนที่ครอบวันที่ส่งใบ HN เปลี่ยน = AN เดิมใช้ไม่ได้แล้ว จึงแทนที่เสมอ */
-    let patientName: string | null = null;
-    let an: string | null = null;
-    let hisVerified = false;
-    try {
-        const [[p], [a]] = await Promise.all([
-            his.execute<RowDataPacket[]>(
-                `SELECT CONCAT(pname, fname, ' ', lname) AS ptname FROM patient WHERE hn = ? LIMIT 1`, [hn]),
-            his.execute<RowDataPacket[]>(
-                `SELECT an FROM ipt WHERE hn = ? AND regdate <= ? AND (dchdate IS NULL OR dchdate >= ?)
-                 ORDER BY regdate DESC, regtime DESC LIMIT 1`, [hn, cur[0].day, cur[0].day]),
-        ]);
-        if (!p[0]) {
-            set.status = 404;
-            return { success: false, message: `ไม่พบ HN ${hn} ใน HIS` };
-        }
-        patientName = (sanitizeHTML(String(p[0].ptname ?? '')) ?? '').trim() || null;
-        an = a[0]?.an ? String(a[0].an) : null;
-        hisVerified = true;
-    } catch (error) {
-        // HIS ล่มไม่ใช่เหตุให้แก้ไม่ได้ ห้องยาจะเห็นป้าย "ยังไม่ได้ยืนยันกับ HIS"
-        console.error('HIS verify on edit hn failed:', error);
+    /* กฎเดียวกับตอนส่งใบ: ต้องนอนอยู่ตึกของใบนี้ HN เปลี่ยน = AN เดิมใช้ไม่ได้แล้ว จึงแทนที่เสมอ */
+    const check = await checkPatientInWard(hn, Number(cur[0].ward));
+    if (!check.ok) {
+        set.status = check.status;
+        return { success: false, message: check.message };
     }
+    const patientName = check.ptname || null;
+    const an = check.an;
+    const hisVerified = check.verified;
 
     try {
         /* เงื่อนไข HN เดิมกับสถานะอยู่ใน WHERE กันอีกเครื่องแก้หรือเปลี่ยนสถานะไปก่อนระหว่างตรวจ HIS */
