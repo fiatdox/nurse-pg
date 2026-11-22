@@ -3,6 +3,7 @@ import { authMiddleware } from '../middlewares/authMiddleware';
 import {
     lookupRxPatient, createRxOrder, listRxOrders, getRxOrder, getRxOrderFile,
     ackRxOrder, completeRxOrder, prepareRxOrder, setRxPickupSlot, pickupRxOrder, closeRxOrder, rejectRxOrder,
+    resubmitRxOrder,
     listRxMissingHn, setRxOrderHn, editRxOrderHn, consultRxOrder,
 } from '../controllers/rxOrderController';
 import { readRxHn, listWardPatients } from '../controllers/rxHnReaderController';
@@ -139,7 +140,16 @@ export const rxOrderRoutes = new Elysia({ prefix: '/api/v1/rx' })
     })
 
     .post('/orders/:id/pickup', pickupRxOrder, {
-        detail: { summary: 'ตึกมารับยาแล้ว ปิดการส่งมอบ ใบออกจากคิว' },
+        detail: { summary: 'ตึกมารับยาแล้ว (หอหรือห้องยากด) ปิดการส่งมอบ ใบออกจากคิว · ใบที่มีรอบกดก่อนรอบเริ่มได้ 409 BEFORE_SLOT' },
+    })
+
+    .post('/orders/:id/resubmit', resubmitRxOrder, {
+        body: t.Object({
+            priority: t.String(),
+            tube_feed: t.Optional(t.Boolean()),
+            note: t.Optional(t.String({ maxLength: 300 })),
+        }),
+        detail: { summary: 'หอแก้ประเภท (ความเร่งด่วน / NG-Tube) ของใบที่ถูกส่งกลับ แล้วส่งเป็นใบใหม่ด้วยไฟล์เดิม เริ่มนับเวลาใหม่' },
     })
 
     .post('/orders/:id/close', closeRxOrder, {

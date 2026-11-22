@@ -2,7 +2,7 @@ import { findActiveRejectCategory } from './rxRejectCategoryController';
 import { Context } from 'elysia';
 import { createHash, randomUUID } from 'crypto';
 import { join, extname } from 'path';
-import { mkdir } from 'fs/promises';
+import { mkdir, unlink } from 'fs/promises';
 import { nurse, his } from '../db';
 import type { RowDataPacket } from 'mysql2';
 import { resolveActor } from '../utils/nursingRecord';
@@ -856,11 +856,32 @@ export const pickupRxOrder = async ({ params, user, set }: Context & { user?: un
     if (!Number.isInteger(id)) { set.status = 400; return { success: false, message: 'เลขที่ไม่ถูกต้อง' }; }
 
     try {
+        /*
+          รับยาตามรอบ: ใบที่มีรอบกดรับก่อนรอบเริ่มไม่ได้ (ทั้งหอและห้องยา)
+          ตึกมาก่อนรอบจริง ให้ห้องยาเปลี่ยนรอบเป็นรอบปัจจุบันก่อน ประวัติจะได้บอกว่าเลื่อนรอบ
+          ใบที่ไม่มีรอบ (ยังไม่เลือก / ใบเก่า) รับได้ทันที
+        */
+        const [cur] = await nurse`
+            SELECT status, TO_CHAR(pickup_from, 'HH24:MI') AS f, TO_CHAR(pickup_to, 'HH24:MI') AS t,
+                   TO_CHAR(pickup_from, 'YYYY-MM-DD') AS d, TO_CHAR(LOCALTIMESTAMP, 'YYYY-MM-DD') AS today,
+                   pickup_from IS NOT NULL AND LOCALTIMESTAMP < pickup_from AS too_early
+            FROM rx_orders WHERE rx_order_id = ${id}`;
+        if (cur?.status === 'prepared' && cur.too_early) {
+            set.status = 409;
+            const day = cur.d === cur.today ? '' : `วันที่ ${cur.d} `;
+            return {
+                success: false,
+                code: 'BEFORE_SLOT',
+                message: `ยังไม่ถึงรอบรับยา (${day}${cur.f}–${cur.t} น.) กดรับได้เมื่อถึงรอบ · ถ้าตึกมาก่อนให้ห้องยาเปลี่ยนรอบก่อน`,
+            };
+        }
+        /* เงื่อนไขรอบอยู่ใน WHERE ด้วย กันกรณีห้องยาเลื่อนรอบออกไประหว่างที่อีกฝั่งกด */
         return await transition(id, ['prepared'], set, actor, () => nurse`
             UPDATE rx_orders
             SET status = 'picked_up', closed_by = ${actor.username},
                 closed_by_name = ${actor.fullname}, closed_at = now()
             WHERE rx_order_id = ${id} AND status = 'prepared'
+              AND (pickup_from IS NULL OR LOCALTIMESTAMP >= pickup_from)
             RETURNING rx_order_id, status, closed_by_name
         ` as unknown as Promise<Record<string, unknown>[]>, 'pickup');
     } catch (error) {
@@ -896,6 +917,121 @@ export const closeRxOrder = async ({ params, user, set }: Context & { user?: unk
         console.error('Close rx order error:', error);
         set.status = 500;
         return { success: false, message: 'ปิดเรื่องไม่สำเร็จ' };
+    }
+};
+
+/**
+ * แก้ประเภทแล้วส่งใหม่ — ห้องยาตีกลับเพราะหอเลือกประเภทผิด (ปกติ / กลับบ้าน / STAT, NG-Tube)
+ *
+ * ไม่ต้องสแกนใหม่: สร้างใบใหม่จากใบเดิม (HN ผู้ป่วย ไฟล์เดิม) ด้วยประเภทที่แก้แล้ว
+ * ใบใหม่เริ่มนับเวลาใหม่ตั้งแต่ตอนนี้ (submitted_at = ตอนกด) ห้องยาเห็นเป็นใบเข้าใหม่ มีเสียงตามความด่วนใหม่
+ * ใบเดิมถูกปิด (closed) และใบใหม่ชี้กลับด้วย resend_of เหมือนการส่งฉบับแก้ สถิติการส่งกลับจึงยังอยู่ครบ
+ *
+ * ไฟล์ถูกคัดลอกเป็นไฟล์ใหม่ ไม่ใช้ path ร่วมกับใบเดิม เพราะระบบลบไฟล์ตามอายุนับแยกรายใบ
+ * body { priority, tube_feed?, note? } · ต้องเปลี่ยนอย่างน้อยหนึ่งอย่าง กันกดส่งของเดิมซ้ำโดยไม่ได้แก้
+ */
+export const resubmitRxOrder = async ({ params, body, user, set }: Context & { user?: unknown }) => {
+    const actor = await getActor(user);
+    if (!actor) return unauthorized(set);
+    const id = Number((params as { id?: string }).id);
+    if (!Number.isInteger(id)) { set.status = 400; return { success: false, message: 'เลขที่ไม่ถูกต้อง' }; }
+
+    const b = (body ?? {}) as { priority?: string; tube_feed?: boolean; note?: string };
+    if (!['routine', 'discharge', 'stat'].includes(String(b.priority))) {
+        set.status = 400;
+        return { success: false, message: 'กรุณาเลือกประเภท (ปกติ / ยากลับบ้าน / STAT)' };
+    }
+    const priority = String(b.priority) as 'routine' | 'discharge' | 'stat';
+
+    const copied: string[] = [];
+    try {
+        const [old] = await nurse`
+            SELECT rx_order_id, ward, hn, an, hn_source, patient_name, his_verified, priority, note, tube_feed, status
+            FROM rx_orders WHERE rx_order_id = ${id}`;
+        if (!old) { set.status = 404; return { success: false, message: 'ไม่พบใบสั่งยานี้' }; }
+        if (old.status !== 'rejected') {
+            set.status = 409;
+            return { success: false, message: 'แก้แล้วส่งใหม่ได้เฉพาะใบที่ห้องยาส่งกลับ และยังไม่ได้ปิดเรื่อง' };
+        }
+        const tubeFeed = typeof b.tube_feed === 'boolean' ? b.tube_feed : Boolean(old.tube_feed);
+        if (priority === old.priority && tubeFeed === Boolean(old.tube_feed)) {
+            set.status = 400;
+            return { success: false, message: 'ประเภทยังเหมือนเดิม — ถ้าต้องแก้อย่างอื่น (ภาพ / HN) ให้สแกนแล้วส่งอีกครั้ง' };
+        }
+        const note = b.note === undefined
+            ? (old.note as string | null)
+            : (sanitizeHTML(String(b.note).trim()) ?? '').slice(0, 300) || null;
+
+        const files = await nurse`
+            SELECT file_no, original_name, stored_path, mime_type, byte_size, sha256
+            FROM rx_order_files WHERE rx_order_id = ${id} AND purged_at IS NULL ORDER BY file_no`;
+        if (files.length === 0) {
+            set.status = 409;
+            return { success: false, message: 'ไฟล์ของใบเดิมถูกลบตามระยะเวลาจัดเก็บแล้ว ต้องสแกนแล้วส่งอีกครั้ง' };
+        }
+
+        /* คัดลอกไฟล์ก่อนเขียนฐานข้อมูล ไฟล์หายจากดิสก์ = หยุดตรงนี้ ไม่สร้างใบที่เปิดดูภาพไม่ได้ */
+        await mkdir(UPLOAD_ROOT, { recursive: true });
+        const newFiles: { f: Record<string, unknown>; path: string }[] = [];
+        for (const f of files) {
+            const src = Bun.file(String(f.stored_path));
+            if (!(await src.exists())) {
+                set.status = 409;
+                return { success: false, message: 'ไม่พบไฟล์ภาพของใบเดิมบนเครื่อง ต้องสแกนแล้วส่งอีกครั้ง' };
+            }
+            const path = join(UPLOAD_ROOT, `${randomUUID()}${extname(String(f.stored_path)) || '.bin'}`);
+            await Bun.write(path, src);
+            copied.push(path);
+            newFiles.push({ f, path });
+        }
+
+        const newId = await nurse.begin(async tx => {
+            /* ปิดใบเดิมก่อน ถ้าอีกเครื่องปิด/ส่งซ้ำไปแล้วจะไม่ได้แถว แล้วยกเลิกทั้งหมด ไม่เกิดใบซ้ำ */
+            const closed = await tx`
+                UPDATE rx_orders SET status = 'closed', closed_by = ${actor.username},
+                    closed_by_name = ${actor.fullname}, closed_at = now()
+                WHERE rx_order_id = ${id} AND status = 'rejected' RETURNING rx_order_id`;
+            if (closed.length === 0) return null;
+            const [ins] = await tx`
+                INSERT INTO rx_orders (ward, hn, an, hn_source, patient_name, his_verified,
+                                       priority, note, submitted_by, submitted_by_name, resend_of, tube_feed)
+                VALUES (${old.ward}, ${old.hn}, ${old.an}, ${old.hn_source}, ${old.patient_name}, ${old.his_verified},
+                        ${priority}, ${note}, ${actor.username}, ${actor.fullname}, ${id}, ${tubeFeed})
+                RETURNING rx_order_id`;
+            for (const { f, path } of newFiles) {
+                await tx`
+                    INSERT INTO rx_order_files (rx_order_id, file_no, original_name, stored_path, mime_type, byte_size, sha256)
+                    VALUES (${ins.rx_order_id}, ${Number(f.file_no)}, ${String(f.original_name)}, ${path}, ${String(f.mime_type)}, ${Number(f.byte_size)}, ${String(f.sha256)})`;
+            }
+            return String(ins.rx_order_id);
+        });
+        if (!newId) {
+            await Promise.all(copied.map(p => unlink(p).catch(() => {})));
+            set.status = 409;
+            return { success: false, message: 'ใบนี้ถูกปิดเรื่องหรือส่งใหม่ไปแล้วจากอีกเครื่อง' };
+        }
+
+        const change = { from: old.priority, to: priority, tube_feed_from: Boolean(old.tube_feed), tube_feed_to: tubeFeed };
+        await logEvent(id, 'close', actor, { reason: 'แก้ประเภทแล้วส่งใหม่', new_order: newId, ...change });
+        await logEvent(newId, 'submit', actor, {
+            ward: Number(old.ward), files: newFiles.length, priority, resend_of: id, tube_feed: tubeFeed, resubmit: change,
+        });
+
+        const at = new Date().toISOString();
+        emitRxOrder('order:status', {
+            rx_order_id: String(id), ward: Number(old.ward), status: 'closed',
+            priority, by_name: actor.fullname, at,
+        });
+        /* ใบเข้าใหม่จริง ห้องยาได้เสียงและเตือนตามความด่วนใหม่ */
+        emitRxOrder('order:new', {
+            rx_order_id: newId, ward: Number(old.ward), status: 'submitted', priority, by_name: actor.fullname, at,
+        });
+        return { success: true, data: { rx_order_id: newId }, message: 'ส่งใบใหม่ให้ห้องยาแล้ว เริ่มนับเวลาใหม่' };
+    } catch (error) {
+        await Promise.all(copied.map(p => unlink(p).catch(() => {})));
+        console.error('Resubmit rx order error:', error);
+        set.status = 500;
+        return { success: false, message: 'ส่งใหม่ไม่สำเร็จ' };
     }
 };
 
