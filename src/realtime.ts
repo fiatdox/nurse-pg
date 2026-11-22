@@ -26,8 +26,13 @@ export interface RxOrderEvent {
     priority: 'routine' | 'discharge' | 'stat';
     by_name: string;
     at: string;
-    /** เหตุผลที่ส่งกลับ หรือหมายเหตุของการแก้ HN (order:hn) */
+    /** เหตุผลที่ส่งกลับ หมายเหตุของการแก้ HN (order:hn) หรือข้อความปรึกษาแพทย์ (order:consult) */
     reason?: string;
+    /** ช่วงเวลาให้ตึกมารับยา 'YYYY-MM-DD HH24:MI' (มีเมื่อ status = prepared) */
+    pickup_from?: string;
+    pickup_to?: string;
+    /** true = ห้องยาเปลี่ยน/กำหนดรอบรับยาของใบที่จัดเสร็จแล้ว */
+    slot_changed?: boolean;
 }
 
 /** ห้องของห้องยา ทุกเครื่องที่เปิดหน้าคิวอยู่ในห้องนี้ แล้วค่อยกรองตึกที่ฝั่งหน้าจอ */
@@ -144,7 +149,7 @@ export const rxRealtimeRoutes = new Elysia()
  * ไม่โยน error ออกไปข้างนอกเด็ดขาด การแจ้งเตือนล้มเหลวต้องไม่ทำให้
  * การบันทึกใบสั่งยาที่สำเร็จไปแล้วกลายเป็นคำขอที่ error ฝั่งผู้ใช้
  */
-export const emitRxOrder = (event: 'order:new' | 'order:status' | 'order:hn', payload: RxOrderEvent) => {
+export const emitRxOrder = (event: 'order:new' | 'order:status' | 'order:hn' | 'order:consult', payload: RxOrderEvent) => {
     try {
         if (!server) return;
         const frame = JSON.stringify({ type: event, ...payload });

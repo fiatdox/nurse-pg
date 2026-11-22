@@ -1,6 +1,7 @@
 import { Elysia, t } from 'elysia';
 import { authMiddleware } from '../middlewares/authMiddleware';
 import { getAiSetting, setAiSetting, getOcrSetting, setOcrSetting } from '../controllers/systemSettingsController';
+import { getStaffOtpSetting, setStaffOtpSetting } from '../controllers/staffOtpSettingController';
 import {
     getMyMenuAccess, getMenuMatrix, saveMenuAccess, resetMenuAccess,
 } from '../controllers/menuAccessController';
@@ -43,6 +44,15 @@ export const systemRoutes = new Elysia({ prefix: '/api/v1/system' })
     .put('/ocr-setting', setOcrSetting, {
         body: t.Object({ engine: t.Union([t.Literal('tesseract'), t.Literal('paddle')]) }),
         detail: { summary: 'เลือกเครื่องมือ OCR: tesseract / paddle (เฉพาะผู้ดูแลระบบ)' },
+    })
+
+    // ---------- MFA: OTP ทาง LINE OA หมอพร้อม ตอนเข้าระบบ ----------
+    .get('/login-otp-setting', getStaffOtpSetting, {
+        detail: { summary: 'สถานะโหมด OTP ตอนเข้าระบบ ความพร้อมของช่องทางส่ง และผู้ใช้คนนี้แก้ได้หรือไม่' },
+    })
+    .put('/login-otp-setting', setStaffOtpSetting, {
+        body: t.Object({ enabled: t.Boolean() }),
+        detail: { summary: 'เปิด/ปิดโหมด OTP ตอนเข้าระบบ (เฉพาะผู้ดูแลระบบ · เปิดได้เมื่อช่องทางส่ง OTP พร้อมจริง)' },
     })
 
     // ---------- การมองเห็นเมนูรายกลุ่ม ----------

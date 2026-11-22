@@ -88,3 +88,62 @@ export const getRxRenal = async ({ params, user, set }: Context & { user?: unkno
         return { success: true, data: null, his_down: true };
     }
 };
+
+/**
+ * INR ของผู้ป่วยในใบสั่งยา ให้เภสัชดูประกอบยาต้านการแข็งตัวของเลือด (warfarin ฯลฯ)
+ *
+ * รหัสแล็บ 220 (INR) ตั้งเพิ่มได้ด้วย RX_INR_LAB_CODES — อย่าใส่ 218 "PT/INR" เพราะผลเป็น PT หน่วยวินาที
+ * ไม่หาจากชื่อรายการ เพราะชื่อที่มีคำว่า INR บางรายการเป็นค่า PT
+ * ส่งชื่อรายการกลับไปด้วย เภสัชจะเห็นว่าค่ามาจากรายการไหน
+ */
+const inrCodes = () => (process.env.RX_INR_LAB_CODES || '220')
+    .split(',').map(c => c.trim()).filter(c => /^[0-9A-Za-z]+$/.test(c));
+
+const MAX_INR_POINTS = 15;
+
+export const getRxInr = async ({ params, user, set }: Context & { user?: unknown }) => {
+    const actor = await resolveActor(user);
+    if (!actor) { set.status = 401; return { success: false, message: 'ไม่พบข้อมูลผู้ใช้' }; }
+
+    const id = Number((params as { id?: string }).id);
+    if (!Number.isInteger(id)) { set.status = 400; return { success: false, message: 'เลขที่ไม่ถูกต้อง' }; }
+
+    const rows = await nurse`SELECT hn FROM rx_orders WHERE rx_order_id = ${id}`;
+    if (rows.length === 0) { set.status = 404; return { success: false, message: 'ไม่พบใบสั่งยานี้' }; }
+    const hn = String(rows[0].hn ?? '').trim();
+    if (!/^\d{9}$/.test(hn)) return { success: true, data: null, message: 'ใบนี้ไม่มี HN' };
+
+    const codes = inrCodes();
+    if (codes.length === 0) return { success: true, data: { points: [] } };
+    try {
+        const [inrRows] = await his.execute<RowDataPacket[]>(
+            `SELECT lo.lab_order_result AS result,
+                    li.lab_items_name AS item_name,
+                    DATE_FORMAT(lh.order_date, '%Y-%m-%d') AS order_date,
+                    TIME_FORMAT(lh.order_time, '%H:%i') AS order_time
+             FROM lab_head lh
+             JOIN lab_order lo ON lo.lab_order_number = lh.lab_order_number
+             LEFT JOIN lab_items li ON li.lab_items_code = lo.lab_items_code
+             WHERE lh.hn = ?
+               AND lo.lab_items_code IN (${codes.map(() => '?').join(', ')})
+               AND lo.lab_order_result REGEXP '^[0-9]+(\\.[0-9]+)?$'
+             ORDER BY lh.order_date DESC, lh.lab_order_number DESC
+             LIMIT ${MAX_INR_POINTS}`, [hn, ...codes]);
+
+        return {
+            success: true,
+            data: {
+                /* ใหม่ → เก่า */
+                points: inrRows.map(r => ({
+                    date: String(r.order_date),
+                    time: r.order_time ? String(r.order_time) : null,
+                    inr: Number(r.result),
+                    item: r.item_name ? String(r.item_name) : null,
+                })),
+            },
+        };
+    } catch (error) {
+        console.error('Get rx INR error:', error);
+        return { success: true, data: null, his_down: true };
+    }
+};

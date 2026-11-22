@@ -2,13 +2,13 @@ import { Elysia, t } from 'elysia';
 import { authMiddleware } from '../middlewares/authMiddleware';
 import {
     lookupRxPatient, createRxOrder, listRxOrders, getRxOrder, getRxOrderFile,
-    ackRxOrder, completeRxOrder, prepareRxOrder, pickupRxOrder, closeRxOrder, rejectRxOrder,
-    listRxMissingHn, setRxOrderHn, editRxOrderHn,
+    ackRxOrder, completeRxOrder, prepareRxOrder, setRxPickupSlot, pickupRxOrder, closeRxOrder, rejectRxOrder,
+    listRxMissingHn, setRxOrderHn, editRxOrderHn, consultRxOrder,
 } from '../controllers/rxOrderController';
 import { readRxHn, listWardPatients } from '../controllers/rxHnReaderController';
 import { getRxRetention } from '../controllers/rxRetentionController';
 import { getRxDashboard } from '../controllers/rxDashboardController';
-import { getRxRenal } from '../controllers/rxRenalController';
+import { getRxInr, getRxRenal } from '../controllers/rxRenalController';
 
 /**
  * ใบสั่งยาจากหอผู้ป่วยถึงห้องยา
@@ -97,6 +97,10 @@ export const rxOrderRoutes = new Elysia({ prefix: '/api/v1/rx' })
         detail: { summary: 'ค่าการทำงานของไตของผู้ป่วยในใบนี้ (Creatinine · eGFR CKD-EPI · CrCl Cockcroft-Gault) สูตรเดียวกับ DUE' },
     })
 
+    .get('/orders/:id/inr', getRxInr, {
+        detail: { summary: 'ผล INR ของผู้ป่วยในใบนี้ (lab_items_code 220 หรือตาม RX_INR_LAB_CODES)' },
+    })
+
     .get('/orders/:id/files/:fileId', getRxOrderFile, {
         detail: { summary: 'เปิดดูไฟล์ใบสั่งยา (บันทึกลงประวัติทุกครั้งที่เปิด) · ไฟล์ที่ลบตามกำหนดแล้วได้ 410' },
     })
@@ -124,7 +128,11 @@ export const rxOrderRoutes = new Elysia({ prefix: '/api/v1/rx' })
     })
 
     .post('/orders/:id/prepare', prepareRxOrder, {
-        detail: { summary: 'จัดยาเสร็จ พร้อมให้หอมารับ (กดได้ทั้งก่อนและหลังคีย์ลง HIS)' },
+        detail: { summary: 'จัดยาเสร็จ พร้อมให้หอมารับ + กำหนดช่วงเวลารับยา 1 ชม. (body: { pickup_from: "YYYY-MM-DD HH:00" } หรือ null = ยังไม่เลือกรอบ)' },
+    })
+
+    .post('/orders/:id/pickup-slot', setRxPickupSlot, {
+        detail: { summary: 'กำหนด/เปลี่ยน/ล้างรอบรับยาของใบที่จัดยาเสร็จแล้ว (body: { pickup_from: "YYYY-MM-DD HH:00" | null })' },
     })
 
     .post('/orders/:id/pickup', pickupRxOrder, {
@@ -143,6 +151,11 @@ export const rxOrderRoutes = new Elysia({ prefix: '/api/v1/rx' })
     .post('/orders/:id/edit-hn', editRxOrderHn, {
         body: t.Object({ hn: t.String(), note: t.String() }),
         detail: { summary: 'หอแก้ HN ของใบที่ส่งแล้ว (ต้องมีหมายเหตุ · ห้องยาได้รับแจ้งเตือนทันที)' },
+    })
+
+    .post('/orders/:id/consult', consultRxOrder, {
+        body: t.Object({ note: t.String({ maxLength: 1000 }), consulted_at: t.Optional(t.String()) }),
+        detail: { summary: 'บันทึกว่าโทรปรึกษาแพทย์แล้ว (เวลา + ข้อความ) หอและห้องยาเห็นร่วมกัน · แจ้งอีกฝั่งทันที' },
     })
 
     .get('/admin/missing-hn', listRxMissingHn, {

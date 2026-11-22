@@ -464,6 +464,8 @@ export const listRxOrders = async ({ query, user, set }: Context & { user?: unkn
                    o.ack_by_name,       TO_CHAR(o.ack_at,       'YYYY-MM-DD HH24:MI') AS ack_at,
                    o.completed_by_name, TO_CHAR(o.completed_at, 'YYYY-MM-DD HH24:MI') AS completed_at,
                    o.prepared_by_name,  TO_CHAR(o.prepared_at,  'YYYY-MM-DD HH24:MI') AS prepared_at,
+                   TO_CHAR(o.pickup_from, 'YYYY-MM-DD HH24:MI') AS pickup_from,
+                   TO_CHAR(o.pickup_to,   'YYYY-MM-DD HH24:MI') AS pickup_to,
                    o.closed_by_name,    TO_CHAR(o.closed_at,    'YYYY-MM-DD HH24:MI') AS closed_at,
                    o.resend_of, o.tube_feed,
                    o.rejected_by_name,  TO_CHAR(o.rejected_at,  'YYYY-MM-DD HH24:MI') AS rejected_at,
@@ -471,9 +473,27 @@ export const listRxOrders = async ({ query, user, set }: Context & { user?: unkn
                    /* ไฟล์ภาพถูกลบตามกำหนดแล้วทุกไฟล์ หน้าจอใช้ติดป้ายบอกก่อนเปิดใบ */
                    NOT EXISTS (SELECT 1 FROM rx_order_files f
                                WHERE f.rx_order_id = o.rx_order_id AND f.purged_at IS NULL) AS files_purged,
-                   EXTRACT(EPOCH FROM (now() - o.submitted_at))::int AS waiting_seconds
+                   EXTRACT(EPOCH FROM (now() - o.submitted_at))::int AS waiting_seconds,
+                   /* การปรึกษาแพทย์ครั้งล่าสุด ให้ทั้งหอและห้องยาเห็นจากรายการโดยไม่ต้องเปิดใบ */
+                   c.consult_at, c.consult_note, c.consult_by_name, COALESCE(c.consult_count, 0) AS consult_count
             FROM rx_orders o
             LEFT JOIN ward w ON w.ward = o.ward
+            LEFT JOIN LATERAL (
+                SELECT d.detail ->> 'consulted_at' AS consult_at,
+                       d.detail ->> 'note'         AS consult_note,
+                       d.actor_name                AS consult_by_name,
+                       COUNT(*) OVER ()::int       AS consult_count
+                FROM (
+                    /* logEvent เก็บเป็นสตริง JSON ซ้อนใน jsonb แกะออกก่อนอ่านฟิลด์ */
+                    SELECT e.at, e.actor_name,
+                           CASE WHEN jsonb_typeof(e.detail) = 'string' THEN (e.detail #>> '{}')::jsonb
+                                ELSE e.detail END AS detail
+                    FROM rx_order_events e
+                    WHERE e.rx_order_id = o.rx_order_id AND e.action = 'consult'
+                ) d
+                ORDER BY d.detail ->> 'consulted_at' DESC, d.at DESC
+                LIMIT 1
+            ) c ON true
             WHERE (${ward}::smallint IS NULL OR o.ward = ${ward})
               AND (${wardArr}::smallint[] IS NULL OR o.ward = ANY(${wardArr}::smallint[]))
               AND (${status}::varchar IS NULL OR o.status = ${status})
@@ -645,7 +665,11 @@ const transition = async (
       อ่านตึกกับความด่วนกลับมาเพื่อส่งไปกับสัญญาณ
       ต้องรู้ตึกถึงจะส่งเข้าห้องของหอที่ส่งใบมาได้ ไม่งั้นหอจะไม่รู้ว่าใบตัวเองถูกรับแล้ว
     */
-    const meta = await nurse`SELECT ward, priority, status FROM rx_orders WHERE rx_order_id = ${id}`;
+    const meta = await nurse`
+        SELECT ward, priority, status,
+               TO_CHAR(pickup_from, 'YYYY-MM-DD HH24:MI') AS pickup_from,
+               TO_CHAR(pickup_to,   'YYYY-MM-DD HH24:MI') AS pickup_to
+        FROM rx_orders WHERE rx_order_id = ${id}`;
     if (meta[0]) {
         emitRxOrder('order:status', {
             rx_order_id: String(id),
@@ -655,6 +679,11 @@ const transition = async (
             by_name: actor.fullname,
             at: new Date().toISOString(),
             reason: typeof detail?.reason === 'string' ? detail.reason : undefined,
+            /* เปลี่ยนรอบของใบที่จัดเสร็จแล้ว — หอแสดงเป็น "เปลี่ยนรอบรับยา" ไม่ใช่ "ยาพร้อมแล้ว" ซ้ำ */
+            ...(action === 'set_pickup_slot' ? { slot_changed: true } : {}),
+            ...(meta[0].status === 'prepared' && meta[0].pickup_from
+                ? { pickup_from: String(meta[0].pickup_from), pickup_to: String(meta[0].pickup_to) }
+                : {}),
         });
     }
 
@@ -711,24 +740,89 @@ export const completeRxOrder = async ({ params, user, set }: Context & { user?: 
  * ถ้าบังคับลำดับ คนจะกดคีย์เสร็จทั้งที่ยังไม่ได้คีย์ เพื่อให้กดปุ่มถัดไปได้
  * แล้วสถานะ "คีย์เสร็จ" จะเชื่อไม่ได้อีกเลย
  */
-export const prepareRxOrder = async ({ params, user, set }: Context & { user?: unknown }) => {
+/** slot รับยายาว 1 ชั่วโมง เริ่มตรงชั่วโมงเท่านั้น เช่น 11:00–12:00 */
+const PICKUP_SLOT_RE = /^(\d{4}-\d{2}-\d{2}) ([01]\d|2[0-3]):00$/;
+
+/**
+ * อ่านรอบรับยาจาก body: 'YYYY-MM-DD HH:00' หรือ null = ยังไม่เลือกรอบ
+ * ไม่ส่งฟิลด์มาเลยเป็น error กันลืมเลือก · รอบต้องอยู่ตั้งแต่ชั่วโมงนี้ถึงภายใน 24 ชม. ข้างหน้า
+ */
+const parsePickupSlot = async (body: unknown): Promise<{ slot: string | null } | { error: string }> => {
+    const raw = (body as { pickup_from?: unknown } | undefined)?.pickup_from;
+    if (raw === null) return { slot: null };
+    const slot = String(raw ?? '').trim();
+    if (!PICKUP_SLOT_RE.test(slot)) {
+        return { error: 'กรุณาเลือกช่วงเวลาให้ตึกมารับยา (เริ่มตรงชั่วโมง เช่น 11:00) หรือเลือก "ยังไม่เลือกรอบ"' };
+    }
+    const [win] = await nurse`
+        SELECT ${slot}::text::timestamp >= date_trunc('hour', LOCALTIMESTAMP)
+           AND ${slot}::text::timestamp <  LOCALTIMESTAMP + interval '24 hours' AS ok`;
+    if (!win?.ok) return { error: 'ช่วงเวลารับยาต้องเริ่มตั้งแต่ชั่วโมงนี้ และไม่เกิน 24 ชั่วโมงข้างหน้า' };
+    return { slot };
+};
+
+export const prepareRxOrder = async ({ params, body, user, set }: Context & { user?: unknown }) => {
     const actor = await getActor(user);
     if (!actor) return unauthorized(set);
     const id = Number((params as { id?: string }).id);
     if (!Number.isInteger(id)) { set.status = 400; return { success: false, message: 'เลขที่ไม่ถูกต้อง' }; }
 
+    /*
+      ต้องบอกตึกว่ามารับได้ช่วงไหน ไม่งั้นตึกเดินมาตอนห้องยายังไม่ว่างส่งมอบ หรือรอโดยไม่รู้ว่าเมื่อไหร่
+      รับเป็นเวลาท้องถิ่น 'YYYY-MM-DD HH:00' (คอลัมน์เวลาของ rx_orders เป็น timestamp ไม่มี timezone)
+    */
+    const parsed = await parsePickupSlot(body);
+    if ('error' in parsed) { set.status = 400; return { success: false, message: parsed.error }; }
+    const slot = parsed.slot;
+
     try {
         return await transition(id, ['acknowledged', 'completed'], set, actor, () => nurse`
             UPDATE rx_orders
             SET status = 'prepared', prepared_by = ${actor.username},
-                prepared_by_name = ${actor.fullname}, prepared_at = now()
+                prepared_by_name = ${actor.fullname}, prepared_at = now(),
+                pickup_from = ${slot}::text::timestamp, pickup_to = ${slot}::text::timestamp + interval '1 hour'  -- null = ยังไม่เลือกรอบ
             WHERE rx_order_id = ${id} AND status IN ('acknowledged', 'completed')
-            RETURNING rx_order_id, status, prepared_by_name
-        ` as unknown as Promise<Record<string, unknown>[]>, 'prepare');
+            RETURNING rx_order_id, status, prepared_by_name,
+                      TO_CHAR(pickup_from, 'YYYY-MM-DD HH24:MI') AS pickup_from,
+                      TO_CHAR(pickup_to,   'YYYY-MM-DD HH24:MI') AS pickup_to
+        ` as unknown as Promise<Record<string, unknown>[]>, 'prepare', { pickup_from: slot });
     } catch (error) {
         console.error('Prepare rx order error:', error);
         set.status = 500;
         return { success: false, message: 'บันทึกว่าจัดยาเสร็จไม่สำเร็จ' };
+    }
+};
+
+/**
+ * กำหนด / เปลี่ยน / ล้างรอบรับยา ของใบที่จัดยาเสร็จแล้วแต่ตึกยังไม่มารับ
+ * เช่น ตอนจัดเสร็จยังไม่เลือกรอบ หรือตึกขอเลื่อน · body { pickup_from: 'YYYY-MM-DD HH:00' | null }
+ * สถานะคงเป็น prepared · ตึกได้สัญญาณพร้อมรอบใหม่ทันที
+ */
+export const setRxPickupSlot = async ({ params, body, user, set }: Context & { user?: unknown }) => {
+    const actor = await getActor(user);
+    if (!actor) return unauthorized(set);
+    const id = Number((params as { id?: string }).id);
+    if (!Number.isInteger(id)) { set.status = 400; return { success: false, message: 'เลขที่ไม่ถูกต้อง' }; }
+
+    const parsed = await parsePickupSlot(body);
+    if ('error' in parsed) { set.status = 400; return { success: false, message: parsed.error }; }
+    const slot = parsed.slot;
+
+    try {
+        const [prev] = await nurse`SELECT TO_CHAR(pickup_from, 'YYYY-MM-DD HH24:MI') AS pickup_from FROM rx_orders WHERE rx_order_id = ${id}`;
+        return await transition(id, ['prepared'], set, actor, () => nurse`
+            UPDATE rx_orders
+            SET pickup_from = ${slot}::text::timestamp, pickup_to = ${slot}::text::timestamp + interval '1 hour'
+            WHERE rx_order_id = ${id} AND status = 'prepared'
+            RETURNING rx_order_id, status,
+                      TO_CHAR(pickup_from, 'YYYY-MM-DD HH24:MI') AS pickup_from,
+                      TO_CHAR(pickup_to,   'YYYY-MM-DD HH24:MI') AS pickup_to
+        ` as unknown as Promise<Record<string, unknown>[]>, 'set_pickup_slot',
+            { pickup_from: slot, previous: prev?.pickup_from ?? null });
+    } catch (error) {
+        console.error('Set rx pickup slot error:', error);
+        set.status = 500;
+        return { success: false, message: 'บันทึกรอบรับยาไม่สำเร็จ' };
     }
 };
 
@@ -1040,5 +1134,82 @@ export const setRxOrderHn = async ({ params, body, user, set }: Context & { user
         console.error('Set rx hn error:', error);
         set.status = 500;
         return { success: false, message: 'บันทึก HN ไม่สำเร็จ' };
+    }
+};
+
+/* ───────────────────────── บันทึกการปรึกษาแพทย์ ───────────────────────── */
+
+/**
+ * บันทึกว่าโทรปรึกษาแพทย์เรื่องใบนี้แล้ว (เวลาไหน คุยว่าอะไร)
+ *
+ * ทั้งหอและห้องยาบันทึกได้ และเห็นของกันและกัน เพื่อไม่ให้สองฝั่งโทรตามแพทย์คนเดียวกันซ้ำ
+ * หรือรอกันโดยไม่รู้ว่าอีกฝั่งคุยไปแล้ว
+ *
+ * เก็บเป็นเหตุการณ์ใน rx_order_events (action = consult) ไม่เพิ่มคอลัมน์
+ * เพราะหนึ่งใบโทรได้หลายครั้ง และประวัติต้องอยู่ครบ ไม่ใช่เขียนทับครั้งก่อน
+ *
+ * เวลาปรึกษาแยกจากเวลาที่กดบันทึก คนมักโทรก่อนแล้วค่อยมาบันทึกทีหลัง
+ * รับเป็นเวลาท้องถิ่น YYYY-MM-DD HH:mm ไม่ส่งมา = ตอนนี้ · ห้ามเป็นเวลาในอนาคต
+ */
+export const consultRxOrder = async ({ params, body, user, set }: Context & { user?: unknown }) => {
+    const actor = await getActor(user);
+    if (!actor) return unauthorized(set);
+
+    const id = Number((params as { id?: string }).id);
+    if (!Number.isInteger(id)) { set.status = 400; return { success: false, message: 'เลขที่ไม่ถูกต้อง' }; }
+
+    const b = (body ?? {}) as { note?: string; consulted_at?: string };
+    const note = (sanitizeHTML(String(b.note ?? '').trim()) ?? '').slice(0, 500);
+    if (note.length < 3) {
+        set.status = 400;
+        return { success: false, message: 'กรุณาระบุว่าคุยกับแพทย์ท่านใด และได้ข้อสรุปว่าอย่างไร' };
+    }
+
+    const raw = String(b.consulted_at ?? '').trim().replace('T', ' ');
+    let consultedAt: string | null = null;
+    if (raw) {
+        if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(raw)) {
+            set.status = 400;
+            return { success: false, message: 'รูปแบบเวลาไม่ถูกต้อง' };
+        }
+        consultedAt = raw;
+    }
+
+    try {
+        /*
+          ให้ PG ตรวจเวลาเอง (เวลาท้องถิ่นของฐานเดียวกับ submitted_at) และคืนค่าเวลาที่ใช้จริง
+          เผื่อนาฬิกาเครื่องลูกช้า/เร็วได้ 5 นาที แต่ย้อนหลังได้ไม่เกิน 7 วัน
+        */
+        const rows = await nurse`
+            SELECT o.ward, o.priority, o.status,
+                   TO_CHAR(COALESCE(${consultedAt}::text::timestamp, date_trunc('minute', now()::timestamp)),
+                           'YYYY-MM-DD HH24:MI') AS consulted_at,
+                   COALESCE(${consultedAt}::text::timestamp, now()::timestamp) <= now()::timestamp + interval '5 minutes'
+                       AS not_future,
+                   COALESCE(${consultedAt}::text::timestamp, now()::timestamp) >= now()::timestamp - interval '7 days'
+                       AS recent
+            FROM rx_orders o WHERE o.rx_order_id = ${id}
+        `;
+        if (rows.length === 0) { set.status = 404; return { success: false, message: 'ไม่พบใบสั่งยานี้' }; }
+        const r = rows[0];
+        if (!r.not_future) { set.status = 400; return { success: false, message: 'เวลาปรึกษาต้องไม่เป็นเวลาในอนาคต' }; }
+        if (!r.recent) { set.status = 400; return { success: false, message: 'บันทึกย้อนหลังได้ไม่เกิน 7 วัน' }; }
+
+        const at = String(r.consulted_at);
+        await logEvent(id, 'consult', actor, { consulted_at: at, note });
+        emitRxOrder('order:consult', {
+            rx_order_id: String(id),
+            ward: Number(r.ward),
+            status: String(r.status) as RxStatus,
+            priority: String(r.priority) as 'routine' | 'discharge' | 'stat',
+            by_name: actor.fullname,
+            at: new Date().toISOString(),
+            reason: note,
+        });
+        return { success: true, data: { rx_order_id: id, consulted_at: at, note, by_name: actor.fullname } };
+    } catch (error) {
+        console.error('Consult rx order error:', error);
+        set.status = 500;
+        return { success: false, message: 'บันทึกการปรึกษาแพทย์ไม่สำเร็จ' };
     }
 };

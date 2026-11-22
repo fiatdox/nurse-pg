@@ -1,6 +1,6 @@
 import { Elysia, t } from 'elysia';
 import { jwt } from '@elysiajs/jwt';
-import { loginCOREKON } from '../controllers/authController';
+import { loginCOREKON, resendLoginOtp, verifyLoginOtp } from '../controllers/authController';
 
 export const authRoutes = new Elysia({ prefix: '/api/v1/auth' })
     // This route group also needs the JWT plugin to sign tokens
@@ -20,4 +20,12 @@ export const authRoutes = new Elysia({ prefix: '/api/v1/auth' })
             security: []
         }
     })
-
+    /* ขั้นที่สองเมื่อเปิดโหมด OTP — otp_token ได้จาก /login ใช้ได้ครั้งเดียวภายใน 10 นาที */
+    .post('/login/otp', verifyLoginOtp, {
+        body: t.Object({ otp_token: t.String({ maxLength: 2000 }), code: t.String({ maxLength: 10 }) }),
+        detail: { tags: ['Auth'], security: [], summary: 'ยืนยัน OTP จาก LINE หมอพร้อม → ได้ token จริง' },
+    })
+    .post('/login/otp/resend', resendLoginOtp, {
+        body: t.Object({ otp_token: t.String({ maxLength: 2000 }) }),
+        detail: { tags: ['Auth'], security: [], summary: 'ขอ OTP ใหม่ (ห่างกันอย่างน้อย 60 วินาที)' },
+    });
