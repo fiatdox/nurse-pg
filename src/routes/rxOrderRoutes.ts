@@ -9,6 +9,9 @@ import { readRxHn, listWardPatients } from '../controllers/rxHnReaderController'
 import { getRxRetention } from '../controllers/rxRetentionController';
 import { getRxDashboard } from '../controllers/rxDashboardController';
 import { getRxInr, getRxRenal } from '../controllers/rxRenalController';
+import {
+    listRejectCategories, createRejectCategory, updateRejectCategory, reorderRejectCategories,
+} from '../controllers/rxRejectCategoryController';
 
 /**
  * ใบสั่งยาจากหอผู้ป่วยถึงห้องยา
@@ -143,9 +146,26 @@ export const rxOrderRoutes = new Elysia({ prefix: '/api/v1/rx' })
         detail: { summary: 'ปิดเรื่องใบที่ส่งกลับ ให้ออกจากคิวของทั้งสองฝั่ง' },
     })
 
+    .get('/reject-categories', listRejectCategories, {
+        query: t.Object({ all: t.Optional(t.String()) }),
+        detail: { summary: 'กลุ่มเหตุผลส่งกลับ (เฉพาะที่เปิดใช้ · all=1 รวมที่ปิด พร้อมจำนวนใบที่ใช้)' },
+    })
+    .post('/reject-categories', createRejectCategory, {
+        body: t.Object({ label: t.String(), require_note: t.Optional(t.Boolean()) }),
+        detail: { summary: 'เพิ่มกลุ่มเหตุผลส่งกลับ (กลุ่มงานเภสัชกรรม/แอดมิน)' },
+    })
+    .post('/reject-categories/reorder', reorderRejectCategories, {
+        body: t.Object({ codes: t.Array(t.String()) }),
+        detail: { summary: 'เรียงลำดับกลุ่มเหตุผลส่งกลับใหม่ทั้งชุด' },
+    })
+    .patch('/reject-categories/:code', updateRejectCategory, {
+        body: t.Object({ label: t.Optional(t.String()), active: t.Optional(t.Boolean()), require_note: t.Optional(t.Boolean()) }),
+        detail: { summary: 'แก้ชื่อ / เปิด-ปิด / บังคับพิมพ์รายละเอียด ของกลุ่มเหตุผลส่งกลับ' },
+    })
+
     .post('/orders/:id/reject', rejectRxOrder, {
-        body: t.Object({ reason: t.String() }),
-        detail: { summary: 'ส่งใบกลับให้หอแก้ไข ต้องระบุเหตุผล' },
+        body: t.Object({ category: t.String(), reason: t.Optional(t.String()) }),
+        detail: { summary: 'ส่งใบกลับให้หอแก้ไข · category = รหัสกลุ่มเหตุผล (GET /reject-categories) · reason = ข้อความเพิ่มเติม (บังคับเมื่อกลุ่มตั้ง require_note)' },
     })
 
     .post('/orders/:id/edit-hn', editRxOrderHn, {

@@ -100,7 +100,8 @@ export const getRxDashboard = async ({ query, user, set }: Context & { user?: un
     const base = nurse`
         SELECT
              o.rx_order_id, o.ward, o.hn, o.priority, o.status, o.hn_source, o.his_verified,
-             o.tube_feed, o.resend_of, o.reject_reason, o.submitted_at, o.rejected_at,
+             o.tube_feed, o.resend_of, o.reject_reason, o.reject_category, o.submitted_at, o.rejected_at,
+             o.prepared_at, o.closed_at, o.pickup_from, o.pickup_to,
              o.ack_by, o.ack_by_name, o.completed_by, o.completed_by_name,
              o.prepared_by, o.prepared_by_name, o.closed_by, o.closed_by_name,
              o.rejected_by, o.rejected_by_name,
@@ -135,7 +136,8 @@ export const getRxDashboard = async ({ query, user, set }: Context & { user?: un
     try {
         const [
             [summary], byPriority, daily, heat, hourly, byWard, staffRows,
-            reasons, hnSource, leadHist, [backlog], [fileStats],
+            rejectCats, reasons, hnSource, leadHist, [backlog], [fileStats],
+            [pickup], slotHours, [extra],
         ] = await Promise.all([
             nurse`
                 WITH b AS (${base})
@@ -218,6 +220,10 @@ export const getRxDashboard = async ({ query, user, set }: Context & { user?: un
                     ,COUNT(*) FILTER (WHERE tube_feed)::int                   AS tube_feed
                     ,${slaCols}
                     ,${durationCols('t_first')}, ${durationCols('t_lead')}, ${durationCols('t_pickup')}
+                    ,COUNT(*) FILTER (WHERE prepared_at IS NOT NULL AND pickup_from IS NOT NULL)::int AS slot_n
+                    ,COUNT(*) FILTER (WHERE status = 'picked_up' AND closed_at >= pickup_to)::int     AS slot_late
+                    ,COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM rx_order_events e
+                        WHERE e.rx_order_id = b.rx_order_id AND e.action = 'consult'))::int          AS consulted
                 FROM b GROUP BY ward ORDER BY orders DESC`,
 
             /*
@@ -237,6 +243,9 @@ export const getRxDashboard = async ({ query, user, set }: Context & { user?: un
                         WHERE status = 'picked_up' AND closed_by IS NOT NULL
                     UNION ALL
                     SELECT rejected_by, rejected_by_name, 'reject', NULL FROM b WHERE rejected_by IS NOT NULL
+                    UNION ALL
+                    SELECT e.actor, e.actor_name, 'consult', NULL FROM rx_order_events e
+                        JOIN b ON b.rx_order_id = e.rx_order_id WHERE e.action = 'consult'
                 )
                 SELECT u AS username, MAX(n) AS name
                     ,COUNT(*) FILTER (WHERE role = 'ack')::int       AS ack
@@ -244,10 +253,21 @@ export const getRxDashboard = async ({ query, user, set }: Context & { user?: un
                     ,COUNT(*) FILTER (WHERE role = 'prep')::int      AS prep
                     ,COUNT(*) FILTER (WHERE role = 'handover')::int  AS handover
                     ,COUNT(*) FILTER (WHERE role = 'reject')::int    AS reject
+                    ,COUNT(*) FILTER (WHERE role = 'consult')::int   AS consult
                     ,percentile_cont(0.5) WITHIN GROUP (ORDER BY t) FILTER (WHERE role = 'ack')  AS t_ack_p50
                     ,percentile_cont(0.5) WITHIN GROUP (ORDER BY t) FILTER (WHERE role = 'key')  AS t_key_p50
                     ,percentile_cont(0.5) WITHIN GROUP (ORDER BY t) FILTER (WHERE role = 'prep') AS t_prep_p50
                 FROM roles GROUP BY u ORDER BY COUNT(*) DESC`,
+
+            /* กลุ่มเหตุผลที่ส่งกลับ (สถิติ) · ใบก่อนมีกลุ่ม = null → "ไม่ระบุกลุ่ม" */
+            nurse`
+                WITH b AS (${base})
+                SELECT COALESCE(b.reject_category, 'unspecified') AS category, MAX(rc.label) AS label, COUNT(*)::int AS n
+                    ,COUNT(DISTINCT b.ward)::int AS wards
+                    ,TO_CHAR(MAX(b.rejected_at), 'YYYY-MM-DD HH24:MI') AS last_at
+                FROM b LEFT JOIN rx_reject_categories rc ON rc.code = b.reject_category
+                WHERE b.rejected_at IS NOT NULL
+                GROUP BY 1 ORDER BY n DESC`,
 
             /* เหตุผลที่ส่งกลับ — จัดกลุ่มแบบตัดช่องว่างและตัวพิมพ์ เหตุผลเดียวกันที่พิมพ์ต่างกันนิดหน่อยจะรวมกัน */
             nurse`
@@ -311,6 +331,63 @@ export const getRxDashboard = async ({ query, user, set }: Context & { user?: un
                      (SELECT COUNT(*) FROM rx_order_files f WHERE f.rx_order_id IN (SELECT rx_order_id FROM b))::int AS files
                     ,(SELECT COUNT(*) FROM rx_order_events e
                         WHERE e.action = 'view_file' AND e.rx_order_id IN (SELECT rx_order_id FROM b))::int AS views`,
+
+            /*
+              รอบรับยา (sql/2026-11-21_rx_pickup_slot.sql) — นับเฉพาะใบที่จัดยาเสร็จแล้ว
+              มารับในรอบ = ตึกกดรับระหว่างรอบ · มาก่อนรอบเริ่มนับแยกเป็น "มาก่อนรอบ"
+              เลยรอบ    = กดรับหลังรอบจบ · ยังไม่มารับและเลยรอบแล้ว = ใบที่ห้องยาควรโทรตาม
+              บันทึกย้อนหลัง = รอบเริ่มก่อนชั่วโมงที่จัดยาเสร็จ (จัดเสร็จแล้วลืมกด มาบันทึกทีหลัง)
+              เปลี่ยนรอบ = เหตุการณ์ set_pickup_slot ที่มีรอบเดิม · ไม่มีรอบเดิม = ตอนจัดเสร็จยังไม่เลือก มาเลือกทีหลัง
+            */
+            nurse`
+                WITH b AS (${base}), p AS (SELECT * FROM b WHERE prepared_at IS NOT NULL),
+                ev AS (
+                    SELECT e.detail ->> 'previous' AS previous FROM rx_order_events e
+                    WHERE e.action = 'set_pickup_slot' AND e.rx_order_id IN (SELECT rx_order_id FROM b)
+                )
+                SELECT
+                     COUNT(*)::int                                                                  AS prepared
+                    ,COUNT(*) FILTER (WHERE pickup_from IS NOT NULL)::int                           AS with_slot
+                    ,COUNT(*) FILTER (WHERE pickup_from < date_trunc('hour', prepared_at))::int    AS retro
+                    ,COUNT(*) FILTER (WHERE status = 'picked_up' AND closed_at < pickup_from)::int AS early
+                    ,COUNT(*) FILTER (WHERE status = 'picked_up' AND closed_at >= pickup_from
+                                                                AND closed_at <  pickup_to)::int   AS on_time
+                    ,COUNT(*) FILTER (WHERE status = 'picked_up' AND closed_at >= pickup_to)::int  AS late
+                    ,COUNT(*) FILTER (WHERE status = 'prepared' AND LOCALTIMESTAMP >= pickup_to)::int AS overdue
+                    ,COUNT(*) FILTER (WHERE status = 'prepared' AND LOCALTIMESTAMP <  pickup_to)::int AS upcoming
+                    ,percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (closed_at - pickup_to)))
+                        FILTER (WHERE status = 'picked_up' AND closed_at >= pickup_to)              AS late_p50
+                    ,percentile_cont(0.9) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (closed_at - pickup_to)))
+                        FILTER (WHERE status = 'picked_up' AND closed_at >= pickup_to)              AS late_p90
+                    ,percentile_cont(0.5) WITHIN GROUP (ORDER BY t_pickup) FILTER (WHERE pickup_from IS NOT NULL) AS t_pickup_slot_p50
+                    ,percentile_cont(0.5) WITHIN GROUP (ORDER BY t_pickup) FILTER (WHERE pickup_from IS NULL)     AS t_pickup_none_p50
+                    ,(SELECT COUNT(*) FROM ev WHERE previous IS NOT NULL)::int                      AS changes
+                    ,(SELECT COUNT(*) FROM ev WHERE previous IS NULL)::int                          AS assigned_later
+                FROM p`,
+
+            /* รอบไหนมีใบมาก และรอบไหนตึกมาไม่ทัน — ใช้วางรอบให้ตรงกับเวลาที่ตึกมารับได้จริง */
+            nurse`
+                WITH b AS (${base})
+                SELECT EXTRACT(HOUR FROM pickup_from)::int AS hour
+                    ,COUNT(*)::int AS n
+                    ,COUNT(*) FILTER (WHERE status = 'picked_up' AND closed_at <  pickup_to)::int AS on_time
+                    ,COUNT(*) FILTER (WHERE status = 'picked_up' AND closed_at >= pickup_to)::int AS late
+                FROM b WHERE prepared_at IS NOT NULL AND pickup_from IS NOT NULL
+                GROUP BY 1 ORDER BY 1`,
+
+            /* ปรึกษาแพทย์ (action = consult) และแก้ HN หลังส่ง (action = edit_hn) */
+            nurse`
+                WITH b AS (${base}),
+                e AS (
+                    SELECT e.action, e.rx_order_id FROM rx_order_events e
+                    WHERE e.action IN ('consult', 'edit_hn') AND e.rx_order_id IN (SELECT rx_order_id FROM b)
+                )
+                SELECT
+                     COUNT(*) FILTER (WHERE action = 'consult')::int                     AS consults
+                    ,COUNT(DISTINCT rx_order_id) FILTER (WHERE action = 'consult')::int  AS consult_orders
+                    ,COUNT(*) FILTER (WHERE action = 'edit_hn')::int                     AS hn_edits
+                    ,COUNT(DISTINCT rx_order_id) FILTER (WHERE action = 'edit_hn')::int  AS hn_edit_orders
+                FROM e`,
         ]);
 
         const pct = (met: unknown, n: unknown) => (int(n) > 0 ? int(met) / int(n) : null);
@@ -335,7 +412,27 @@ export const getRxDashboard = async ({ query, user, set }: Context & { user?: un
                     durations: pickDurations(summary),
                     files: int(fileStats?.files),
                     file_views: int(fileStats?.views),
+                    consults: int(extra?.consults),
+                    consult_orders: int(extra?.consult_orders),
+                    hn_edits: int(extra?.hn_edits),
+                    hn_edit_orders: int(extra?.hn_edit_orders),
                 },
+                pickup: {
+                    prepared: int(pickup?.prepared),
+                    with_slot: int(pickup?.with_slot),
+                    retro: int(pickup?.retro),
+                    early: int(pickup?.early),
+                    on_time: int(pickup?.on_time),
+                    late: int(pickup?.late),
+                    overdue: int(pickup?.overdue),
+                    upcoming: int(pickup?.upcoming),
+                    late_by: { p50: num(pickup?.late_p50), p90: num(pickup?.late_p90) },
+                    t_pickup_slot_p50: num(pickup?.t_pickup_slot_p50),
+                    t_pickup_none_p50: num(pickup?.t_pickup_none_p50),
+                    changes: int(pickup?.changes),
+                    assigned_later: int(pickup?.assigned_later),
+                },
+                slot_hours: slotHours.map(r => ({ hour: int(r.hour), n: int(r.n), on_time: int(r.on_time), late: int(r.late) })),
                 by_priority: byPriority.map(r => ({
                     priority: String(r.priority),
                     orders: int(r.orders),
@@ -375,16 +472,29 @@ export const getRxDashboard = async ({ query, user, set }: Context & { user?: un
                     t_first: { p50: num(r.t_first_p50), p90: num(r.t_first_p90) },
                     t_lead: { p50: num(r.t_lead_p50), p90: num(r.t_lead_p90) },
                     t_pickup: { p50: num(r.t_pickup_p50), p90: num(r.t_pickup_p90) },
+                    slot_n: int(r.slot_n),
+                    slot_late: int(r.slot_late),
+                    consulted: int(r.consulted),
                 })),
                 by_staff: staffRows.map(r => ({
                     username: String(r.username),
                     name: sanitizeHTML(String(r.name ?? r.username)),
                     ack: int(r.ack), key: int(r.key), prep: int(r.prep),
-                    handover: int(r.handover), reject: int(r.reject),
+                    handover: int(r.handover), reject: int(r.reject), consult: int(r.consult),
                     t_ack_p50: num(r.t_ack_p50),
                     t_key_p50: num(r.t_key_p50),
                     t_prep_p50: num(r.t_prep_p50),
                 })),
+                reject_categories: rejectCats.map(r => {
+                    const code = String(r.category);
+                    return {
+                        category: code,
+                        label: code === 'unspecified' ? 'ไม่ระบุกลุ่ม (ใบก่อนมีกลุ่ม)' : sanitizeHTML(String(r.label ?? code)),
+                        n: int(r.n),
+                        wards: int(r.wards),
+                        last_at: r.last_at,
+                    };
+                }),
                 reject_reasons: reasons.map(r => ({
                     reason: sanitizeHTML(String(r.reason ?? '')),
                     n: int(r.n),

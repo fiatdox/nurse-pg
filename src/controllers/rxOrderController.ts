@@ -1,3 +1,4 @@
+import { findActiveRejectCategory } from './rxRejectCategoryController';
 import { Context } from 'elysia';
 import { createHash, randomUUID } from 'crypto';
 import { join, extname } from 'path';
@@ -459,7 +460,7 @@ export const listRxOrders = async ({ query, user, set }: Context & { user?: unkn
     try {
         const rows = await nurse`
             SELECT o.rx_order_id, o.ward, w.ward_name, o.hn, o.an, o.patient_name,
-                   o.hn_source, o.his_verified, o.priority, o.status, o.note, o.reject_reason,
+                   o.hn_source, o.his_verified, o.priority, o.status, o.note, o.reject_reason, o.reject_category, rc.label AS reject_category_label,
                    o.submitted_by_name, TO_CHAR(o.submitted_at, 'YYYY-MM-DD HH24:MI') AS submitted_at,
                    o.ack_by_name,       TO_CHAR(o.ack_at,       'YYYY-MM-DD HH24:MI') AS ack_at,
                    o.completed_by_name, TO_CHAR(o.completed_at, 'YYYY-MM-DD HH24:MI') AS completed_at,
@@ -478,6 +479,7 @@ export const listRxOrders = async ({ query, user, set }: Context & { user?: unkn
                    c.consult_at, c.consult_note, c.consult_by_name, COALESCE(c.consult_count, 0) AS consult_count
             FROM rx_orders o
             LEFT JOIN ward w ON w.ward = o.ward
+            LEFT JOIN rx_reject_categories rc ON rc.code = o.reject_category
             LEFT JOIN LATERAL (
                 SELECT d.detail ->> 'consulted_at' AS consult_at,
                        d.detail ->> 'note'         AS consult_note,
@@ -530,14 +532,18 @@ export const getRxOrder = async ({ params, user, set }: Context & { user?: unkno
 
     try {
         const rows = await nurse`
-            SELECT o.*, w.ward_name,
+            SELECT o.*, w.ward_name, orc.label AS reject_category_label,
                    TO_CHAR(o.submitted_at, 'YYYY-MM-DD HH24:MI') AS submitted_at_text,
                    /* ใบก่อนหน้าถูกตีกลับเพราะอะไร ห้องยาต้องรู้เพื่อจะได้ตรวจจุดนั้นก่อน */
                    prev.reject_reason AS prev_reject_reason,
+                   prev.reject_category AS prev_reject_category,
+                   prc.label AS prev_reject_category_label,
                    TO_CHAR(prev.rejected_at, 'DD/MM/YYYY HH24:MI') AS prev_rejected_at
             FROM rx_orders o
             LEFT JOIN ward w ON w.ward = o.ward
             LEFT JOIN rx_orders prev ON prev.rx_order_id = o.resend_of
+            LEFT JOIN rx_reject_categories prc ON prc.code = prev.reject_category
+            LEFT JOIN rx_reject_categories orc ON orc.code = o.reject_category
             WHERE o.rx_order_id = ${id}
         `;
         if (rows.length === 0) {
@@ -678,7 +684,12 @@ const transition = async (
             priority: String(meta[0].priority) as 'routine' | 'discharge' | 'stat',
             by_name: actor.fullname,
             at: new Date().toISOString(),
-            reason: typeof detail?.reason === 'string' ? detail.reason : undefined,
+            /* ส่งกลับ: หอเห็น "[กลุ่ม] ข้อความ" ในแจ้งเตือน · ไม่ได้พิมพ์เพิ่ม ข้อความคือชื่อกลุ่มอยู่แล้ว ไม่ซ้ำ */
+            reason: typeof detail?.reason === 'string'
+                ? (typeof detail.category_label === 'string' && detail.reason !== detail.category_label
+                    ? `[${detail.category_label}] ${detail.reason}`
+                    : detail.reason)
+                : undefined,
             /* เปลี่ยนรอบของใบที่จัดเสร็จแล้ว — หอแสดงเป็น "เปลี่ยนรอบรับยา" ไม่ใช่ "ยาพร้อมแล้ว" ซ้ำ */
             ...(action === 'set_pickup_slot' ? { slot_changed: true } : {}),
             ...(meta[0].status === 'prepared' && meta[0].pickup_from
@@ -745,19 +756,24 @@ const PICKUP_SLOT_RE = /^(\d{4}-\d{2}-\d{2}) ([01]\d|2[0-3]):00$/;
 
 /**
  * อ่านรอบรับยาจาก body: 'YYYY-MM-DD HH:00' หรือ null = ยังไม่เลือกรอบ
- * ไม่ส่งฟิลด์มาเลยเป็น error กันลืมเลือก · รอบต้องอยู่ตั้งแต่ชั่วโมงนี้ถึงภายใน 24 ชม. ข้างหน้า
+ * ไม่ส่งฟิลด์มาเลยเป็น error กันลืมเลือก · รอบต้องอยู่ตั้งแต่ชั่วโมงที่หอส่งใบ ถึงภายใน 24 ชม. ข้างหน้า
  */
-const parsePickupSlot = async (body: unknown): Promise<{ slot: string | null } | { error: string }> => {
+const parsePickupSlot = async (body: unknown, id: number): Promise<{ slot: string | null } | { error: string }> => {
     const raw = (body as { pickup_from?: unknown } | undefined)?.pickup_from;
     if (raw === null) return { slot: null };
     const slot = String(raw ?? '').trim();
     if (!PICKUP_SLOT_RE.test(slot)) {
         return { error: 'กรุณาเลือกช่วงเวลาให้ตึกมารับยา (เริ่มตรงชั่วโมง เช่น 11:00) หรือเลือก "ยังไม่เลือกรอบ"' };
     }
+    /*
+      ย้อนหลังได้ถึงชั่วโมงที่หอส่งใบ: ห้องยาจัดเสร็จแล้วลืมกด พอกลับมากดตอนบ่ายต้องบันทึกรอบจริงที่ตึกมารับ (เช่น 11:00) ได้
+      ข้างหน้าไม่เกิน 24 ชั่วโมงจากตอนนี้ · ใบไม่พบ = ไม่ผ่าน (transition ตอบ 404 ให้อีกชั้น)
+    */
     const [win] = await nurse`
-        SELECT ${slot}::text::timestamp >= date_trunc('hour', LOCALTIMESTAMP)
-           AND ${slot}::text::timestamp <  LOCALTIMESTAMP + interval '24 hours' AS ok`;
-    if (!win?.ok) return { error: 'ช่วงเวลารับยาต้องเริ่มตั้งแต่ชั่วโมงนี้ และไม่เกิน 24 ชั่วโมงข้างหน้า' };
+        SELECT ${slot}::text::timestamp >= date_trunc('hour', o.submitted_at)
+           AND ${slot}::text::timestamp <  LOCALTIMESTAMP + interval '24 hours' AS ok
+        FROM rx_orders o WHERE o.rx_order_id = ${id}`;
+    if (!win?.ok) return { error: 'ช่วงเวลารับยาต้องไม่ก่อนเวลาที่หอส่งใบ และไม่เกิน 24 ชั่วโมงข้างหน้า' };
     return { slot };
 };
 
@@ -771,7 +787,7 @@ export const prepareRxOrder = async ({ params, body, user, set }: Context & { us
       ต้องบอกตึกว่ามารับได้ช่วงไหน ไม่งั้นตึกเดินมาตอนห้องยายังไม่ว่างส่งมอบ หรือรอโดยไม่รู้ว่าเมื่อไหร่
       รับเป็นเวลาท้องถิ่น 'YYYY-MM-DD HH:00' (คอลัมน์เวลาของ rx_orders เป็น timestamp ไม่มี timezone)
     */
-    const parsed = await parsePickupSlot(body);
+    const parsed = await parsePickupSlot(body, id);
     if ('error' in parsed) { set.status = 400; return { success: false, message: parsed.error }; }
     const slot = parsed.slot;
 
@@ -804,7 +820,7 @@ export const setRxPickupSlot = async ({ params, body, user, set }: Context & { u
     const id = Number((params as { id?: string }).id);
     if (!Number.isInteger(id)) { set.status = 400; return { success: false, message: 'เลขที่ไม่ถูกต้อง' }; }
 
-    const parsed = await parsePickupSlot(body);
+    const parsed = await parsePickupSlot(body, id);
     if ('error' in parsed) { set.status = 400; return { success: false, message: parsed.error }; }
     const slot = parsed.slot;
 
@@ -889,22 +905,33 @@ export const rejectRxOrder = async ({ params, body, user, set }: Context & { use
     const id = Number((params as { id?: string }).id);
     if (!Number.isInteger(id)) { set.status = 400; return { success: false, message: 'เลขที่ไม่ถูกต้อง' }; }
 
-    const reason = String((body as { reason?: string } | undefined)?.reason ?? '').trim();
-    /* บังคับเหตุผล เพราะหอต้องรู้ว่าต้องแก้อะไรถึงจะส่งใหม่ได้ ไม่ใช่เดาเอง */
-    if (reason.length < 3) {
+    const b = body as { reason?: string; category?: string } | undefined;
+    const reason = String(b?.reason ?? '').trim();
+    /*
+      กลุ่มเหตุผล (ใช้ทำสถิติ) บังคับเลือก · ข้อความอิสระยังเก็บไว้เป็นรายละเอียดให้หอรู้ว่าต้องแก้อะไร
+      กลุ่ม "อื่น ๆ" ต้องพิมพ์เหตุผลเอง กลุ่มอื่นไม่พิมพ์ก็ได้ — ไม่พิมพ์ใช้ชื่อกลุ่มเป็นเหตุผลที่หอเห็น
+    */
+    const cat = await findActiveRejectCategory(b?.category);
+    if (!cat) {
         set.status = 400;
-        return { success: false, message: 'กรุณาระบุเหตุผลที่ส่งกลับ' };
+        return { success: false, message: 'กรุณาเลือกกลุ่มเหตุผลที่ส่งกลับ' };
     }
+    if (cat.require_note && reason.length < 3) {
+        set.status = 400;
+        return { success: false, message: `กลุ่ม "${cat.label}" กรุณาพิมพ์เหตุผลที่ส่งกลับ` };
+    }
+    const category = cat.code;
+    const text = (sanitizeHTML(reason || cat.label) ?? '').slice(0, 500);
 
     try {
         return await transition(id, ['submitted', 'acknowledged'], set, actor, () => nurse`
             UPDATE rx_orders
             SET status = 'rejected', rejected_by = ${actor.username},
                 rejected_by_name = ${actor.fullname}, rejected_at = now(),
-                reject_reason = ${(sanitizeHTML(reason) ?? '').slice(0, 500)}
+                reject_reason = ${text}, reject_category = ${category}
             WHERE rx_order_id = ${id} AND status IN ('submitted', 'acknowledged')
-            RETURNING rx_order_id, status, rejected_by_name
-        ` as unknown as Promise<Record<string, unknown>[]>, 'reject', { reason });
+            RETURNING rx_order_id, status, rejected_by_name, reject_category
+        ` as unknown as Promise<Record<string, unknown>[]>, 'reject', { reason: text, category, category_label: cat.label });
     } catch (error) {
         console.error('Reject rx order error:', error);
         set.status = 500;
