@@ -4,7 +4,7 @@ import {
     lookupRxPatient, createRxOrder, listRxOrders, getRxOrder, getRxOrderFile,
     ackRxOrder, completeRxOrder, prepareRxOrder, setRxPickupSlot, pickupRxOrder, closeRxOrder, rejectRxOrder,
     resubmitRxOrder,
-    listRxMissingHn, setRxOrderHn, editRxOrderHn, consultRxOrder,
+    listRxMissingHn, setRxOrderHn, editRxOrderHn, consultRxOrder, changeRxOrderWard, ackRxOrderWard,
 } from '../controllers/rxOrderController';
 import { readRxHn, listWardPatients } from '../controllers/rxHnReaderController';
 import { getRxRetention } from '../controllers/rxRetentionController';
@@ -141,6 +141,19 @@ export const rxOrderRoutes = new Elysia({ prefix: '/api/v1/rx' })
 
     .post('/orders/:id/pickup', pickupRxOrder, {
         detail: { summary: 'ตึกมารับยาแล้ว (หอหรือห้องยากด) ปิดการส่งมอบ ใบออกจากคิว · ใบที่มีรอบกดก่อนรอบเริ่มได้ 409 BEFORE_SLOT' },
+    })
+
+    .post('/orders/:id/ward', changeRxOrderWard, {
+        body: t.Object({
+            ward: t.Union([t.Number(), t.String()]),
+            note: t.String({ maxLength: 300 }),
+            force: t.Optional(t.Boolean()),
+        }),
+        detail: { summary: 'หอย้ายตึกของใบที่ยังไม่จบ (ผู้ป่วยย้ายตึก) — ฝั่งพยาบาลเท่านั้น · HIS ไม่ยืนยันได้ 409 NOT_IN_WARD ส่ง force: true เพื่อยืนยัน' },
+    })
+
+    .post('/orders/:id/ward-ack', ackRxOrderWard, {
+        detail: { summary: 'ห้องยากดรับทราบการย้ายตึก (ย้ายยาไปช่องตึกใหม่แล้ว) — ใบเดินขั้นตอนต่อตามเดิม' },
     })
 
     .post('/orders/:id/resubmit', resubmitRxOrder, {

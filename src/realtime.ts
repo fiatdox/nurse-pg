@@ -33,6 +33,12 @@ export interface RxOrderEvent {
     pickup_to?: string;
     /** true = ห้องยาเปลี่ยน/กำหนดรอบรับยาของใบที่จัดเสร็จแล้ว */
     slot_changed?: boolean;
+    /** order:ward — ตึกเดิมของใบที่หอย้ายตึก (ward = ตึกใหม่) สัญญาณส่งเข้าห้องของทั้งสองตึก */
+    from_ward?: number;
+    from_ward_name?: string;
+    ward_name?: string;
+    /** order:ward — true = ห้องยากดรับทราบการย้ายตึกแล้ว (ไม่ใช่การย้ายครั้งใหม่) */
+    ward_ack?: boolean;
 }
 
 /** ห้องของห้องยา ทุกเครื่องที่เปิดหน้าคิวอยู่ในห้องนี้ แล้วค่อยกรองตึกที่ฝั่งหน้าจอ */
@@ -149,12 +155,14 @@ export const rxRealtimeRoutes = new Elysia()
  * ไม่โยน error ออกไปข้างนอกเด็ดขาด การแจ้งเตือนล้มเหลวต้องไม่ทำให้
  * การบันทึกใบสั่งยาที่สำเร็จไปแล้วกลายเป็นคำขอที่ error ฝั่งผู้ใช้
  */
-export const emitRxOrder = (event: 'order:new' | 'order:status' | 'order:hn' | 'order:consult', payload: RxOrderEvent) => {
+export const emitRxOrder = (event: 'order:new' | 'order:status' | 'order:hn' | 'order:consult' | 'order:ward', payload: RxOrderEvent) => {
     try {
         if (!server) return;
         const frame = JSON.stringify({ type: event, ...payload });
         server.publish(PHARMACY_TOPIC, frame);
         server.publish(wardTopic(payload.ward), frame);
+        /* ย้ายตึก: ตึกเดิมต้องรู้ด้วยว่าใบออกไปแล้ว */
+        if (payload.from_ward && payload.from_ward !== payload.ward) server.publish(wardTopic(payload.from_ward), frame);
     } catch (error) {
         console.error('emitRxOrder failed:', error);
     }

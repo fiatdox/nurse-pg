@@ -12,6 +12,7 @@ import { admissionsOf, hisWardCode } from './rxHnReaderController';
 import { retentionDays } from './rxRetentionController';
 import { emitRxOrder, type RxStatus } from '../realtime';
 import { isAdmin } from './systemSettingsController';
+import { resolveGroups } from '../utils/userGroup';
 
 /**
  * ระบบส่งใบสั่งยาจากหอผู้ป่วยไปห้องยา
@@ -476,7 +477,17 @@ export const listRxOrders = async ({ query, user, set }: Context & { user?: unkn
                                WHERE f.rx_order_id = o.rx_order_id AND f.purged_at IS NULL) AS files_purged,
                    EXTRACT(EPOCH FROM (now() - o.submitted_at))::int AS waiting_seconds,
                    /* การปรึกษาแพทย์ครั้งล่าสุด ให้ทั้งหอและห้องยาเห็นจากรายการโดยไม่ต้องเปิดใบ */
-                   c.consult_at, c.consult_note, c.consult_by_name, COALESCE(c.consult_count, 0) AS consult_count
+                   c.consult_at, c.consult_note, c.consult_by_name, COALESCE(c.consult_count, 0) AS consult_count,
+                   /*
+                     หอย้ายตึกของใบหลังส่ง (ครั้งล่าสุด) — ห้องยาเห็นป้าย "ย้ายจาก ..." จะได้จัดยาเข้าช่องของตึกใหม่
+                     ward_move_pending = ห้องยายังไม่กดรับทราบการย้ายครั้งนี้ (ack_ward หลังเวลาย้าย)
+                   */
+                   mv.d ->> 'from_name' AS moved_from_name,
+                   mv.d ->> 'note'      AS moved_note,
+                   mv.actor_name        AS moved_by_name,
+                   TO_CHAR(mv.at, 'YYYY-MM-DD HH24:MI') AS moved_at,
+                   (mv.at IS NOT NULL AND NOT mv.acked) AS ward_move_pending,
+                   mv.ack_by_name       AS ward_ack_by_name
             FROM rx_orders o
             LEFT JOIN ward w ON w.ward = o.ward
             LEFT JOIN rx_reject_categories rc ON rc.code = o.reject_category
@@ -496,6 +507,19 @@ export const listRxOrders = async ({ query, user, set }: Context & { user?: unkn
                 ORDER BY d.detail ->> 'consulted_at' DESC, d.at DESC
                 LIMIT 1
             ) c ON true
+            LEFT JOIN LATERAL (
+                SELECT CASE WHEN jsonb_typeof(e.detail) = 'string' THEN (e.detail #>> '{}')::jsonb
+                            ELSE e.detail END AS d,
+                       e.at, e.actor_name, a.actor_name AS ack_by_name, a.at IS NOT NULL AS acked
+                FROM rx_order_events e
+                LEFT JOIN LATERAL (
+                    SELECT x.actor_name, x.at FROM rx_order_events x
+                    WHERE x.rx_order_id = o.rx_order_id AND x.action = 'ack_ward' AND x.at >= e.at
+                    ORDER BY x.at LIMIT 1
+                ) a ON true
+                WHERE e.rx_order_id = o.rx_order_id AND e.action = 'change_ward'
+                ORDER BY e.at DESC LIMIT 1
+            ) mv ON true
             WHERE (${ward}::smallint IS NULL OR o.ward = ${ward})
               AND (${wardArr}::smallint[] IS NULL OR o.ward = ANY(${wardArr}::smallint[]))
               AND (${status}::varchar IS NULL OR o.status = ${status})
@@ -1163,6 +1187,138 @@ export const editRxOrderHn = async ({ params, body, user, set }: Context & { use
         console.error('Edit rx hn error:', error);
         set.status = 500;
         return { success: false, message: 'แก้ HN ไม่สำเร็จ' };
+    }
+};
+
+/* ───────────────────────── หอย้ายตึกของใบ ───────────────────────── */
+
+/**
+ * หอย้ายตึกของใบที่ส่งไปแล้ว — ผู้ป่วยย้ายตึก (เช่น ออกจาก ICU) ระหว่างรอยา
+ *
+ * ฝั่งพยาบาลเท่านั้น: กลุ่มงานพยาบาล หรือแอดมินที่ไม่ได้อยู่กลุ่มห้องยา
+ * ห้องยาห้ามย้ายเอง เพราะตึกเป็นคนรู้ว่าผู้ป่วยไปอยู่ไหนและใครจะมารับยา
+ *
+ * ตรวจกับ HIS ว่าผู้ป่วยอยู่ตึกใหม่แล้ว · HIS ยังไม่อัปเดตการย้าย (หรือตึกยังไม่ผูกรหัส HIS)
+ * ได้ 409 NOT_IN_WARD ให้หน้าจอถามยืนยัน แล้วส่ง force มาอีกครั้ง (บันทึกไว้ว่า HIS ไม่ยืนยัน)
+ * บังคับหมายเหตุ · ใช้กับใบที่ยังไม่จบ (รอรับ → ยาพร้อมรอมารับ) รอบรับยาเดิมยังอยู่
+ */
+export const changeRxOrderWard = async ({ params, body, user, set }: Context & { user?: unknown }) => {
+    const actor = await getActor(user);
+    if (!actor) return unauthorized(set);
+    const info = await resolveGroups(user);
+    const allowed = !!info && !info.groups.includes('pharmacy') && (info.groups.includes('nursing') || info.isAdmin);
+    if (!allowed) {
+        set.status = 403;
+        return { success: false, message: 'ย้ายตึกได้เฉพาะฝั่งพยาบาล (ห้องยาย้ายตึกเองไม่ได้ ให้แจ้งหอผู้ป่วย)' };
+    }
+
+    const id = Number((params as { id?: string }).id);
+    if (!Number.isInteger(id)) { set.status = 400; return { success: false, message: 'เลขที่ไม่ถูกต้อง' }; }
+    const b = (body ?? {}) as { ward?: number | string; note?: string; force?: boolean };
+    const toWard = Number(b.ward);
+    if (!Number.isInteger(toWard) || toWard <= 0) { set.status = 400; return { success: false, message: 'กรุณาเลือกตึกใหม่' }; }
+    const note = (sanitizeHTML(String(b.note ?? '').trim()) ?? '').slice(0, 300);
+    if (note.length < 3) { set.status = 400; return { success: false, message: 'กรุณาระบุหมายเหตุ เช่น ย้ายจาก ICU ไปตึกอายุรกรรม' }; }
+
+    try {
+        const [cur] = await nurse`
+            SELECT o.ward, o.hn, o.status, w.ward_name FROM rx_orders o
+            LEFT JOIN ward w ON w.ward = o.ward WHERE o.rx_order_id = ${id}`;
+        if (!cur) { set.status = 404; return { success: false, message: 'ไม่พบใบสั่งยานี้' }; }
+        if (!HN_EDITABLE.includes(String(cur.status) as RxStatus)) {
+            set.status = 409;
+            return { success: false, message: 'ใบนี้ย้ายตึกไม่ได้แล้ว (ส่งกลับ รับยาไปแล้ว หรือปิดเรื่องแล้ว)' };
+        }
+        const fromWard = Number(cur.ward);
+        if (fromWard === toWard) { set.status = 400; return { success: false, message: 'ตึกใหม่เป็นตึกเดิม' }; }
+        const [to] = await nurse`SELECT ward, ward_name FROM ward WHERE ward = ${toWard} AND is_active = 'Y'`;
+        if (!to) { set.status = 400; return { success: false, message: 'ไม่พบตึกนี้ หรือตึกถูกปิดใช้งานแล้ว' }; }
+
+        /* ผู้ป่วยอยู่ตึกใหม่จริงไหม · HIS ล่ม = ผ่าน (เหมือนตอนส่งใบ) · ไม่อยู่ = ถามยืนยันก่อน */
+        let hisOk: boolean | null = null;
+        const hn = String(cur.hn ?? '').trim();
+        if (hn) {
+            const check = await checkPatientInWard(hn, toWard);
+            hisOk = check.ok ? (check.verified ? true : null) : false;
+            if (!check.ok && !b.force) {
+                set.status = 409;
+                return { success: false, code: 'NOT_IN_WARD', message: `${check.message.replace(/ · ส่งได้.*$/, '')} · ถ้าเพิ่งย้ายและ HIS ยังไม่อัปเดต กดยืนยันเพื่อย้ายต่อ` };
+            }
+        }
+
+        /* ตึกเดิมกับสถานะอยู่ใน WHERE กันอีกเครื่องย้าย/เปลี่ยนสถานะไปก่อนระหว่างตรวจ HIS */
+        const rows = await nurse`
+            UPDATE rx_orders SET ward = ${toWard}
+            WHERE rx_order_id = ${id} AND ward = ${fromWard} AND status IN ${nurse(HN_EDITABLE)}
+            RETURNING priority, status`;
+        if (rows.length === 0) {
+            set.status = 409;
+            return { success: false, message: 'ใบนี้ถูกย้ายหรือเปลี่ยนสถานะไปก่อนแล้ว กรุณาเปิดดูใหม่' };
+        }
+        const fromName = String(cur.ward_name ?? `ตึก ${fromWard}`);
+        const toName = String(to.ward_name ?? `ตึก ${toWard}`);
+        await logEvent(id, 'change_ward', actor, { from: fromWard, to: toWard, from_name: fromName, to_name: toName, note, his_ok: hisOk });
+        emitRxOrder('order:ward', {
+            rx_order_id: String(id), ward: toWard, ward_name: toName, from_ward: fromWard, from_ward_name: fromName,
+            status: String(rows[0].status) as RxStatus,
+            priority: String(rows[0].priority) as 'routine' | 'discharge' | 'stat',
+            by_name: actor.fullname, at: new Date().toISOString(), reason: note,
+        });
+        return { success: true, data: { rx_order_id: id, ward: toWard, ward_name: toName, from_ward: fromWard, his_ok: hisOk } };
+    } catch (error) {
+        console.error('Change rx ward error:', error);
+        set.status = 500;
+        return { success: false, message: 'ย้ายตึกไม่สำเร็จ' };
+    }
+};
+
+/**
+ * ห้องยารับทราบการย้ายตึก (ย้ายยาไปช่องรับของตึกใหม่แล้ว) — กดจากการ์ด
+ * ใบเดินขั้นตอนต่อตามเดิม ไม่ได้เริ่มใหม่ · นี่คือการยืนยันว่าเห็นแล้ว ป้ายเตือนบนการ์ดจะหายไป
+ * กลุ่มห้องยาหรือแอดมินเท่านั้น · กดซ้ำได้ 409 (ไม่มีการย้ายที่รอรับทราบ)
+ */
+export const ackRxOrderWard = async ({ params, user, set }: Context & { user?: unknown }) => {
+    const actor = await getActor(user);
+    if (!actor) return unauthorized(set);
+    const info = await resolveGroups(user);
+    if (!info || !(info.groups.includes('pharmacy') || info.isAdmin)) {
+        set.status = 403;
+        return { success: false, message: 'รับทราบการย้ายตึกได้เฉพาะห้องยา' };
+    }
+    const id = Number((params as { id?: string }).id);
+    if (!Number.isInteger(id)) { set.status = 400; return { success: false, message: 'เลขที่ไม่ถูกต้อง' }; }
+
+    try {
+        /* ล็อกแถวใบก่อนตรวจ กันสองเครื่องกดพร้อมกันแล้วได้ ack ซ้ำ */
+        const res = await nurse.begin(async tx => {
+            const [o] = await tx`SELECT ward, priority, status FROM rx_orders WHERE rx_order_id = ${id} FOR UPDATE`;
+            if (!o) return { code: 404 as const };
+            const [p] = await tx`
+                SELECT e.at FROM rx_order_events e
+                WHERE e.rx_order_id = ${id} AND e.action = 'change_ward'
+                  AND NOT EXISTS (SELECT 1 FROM rx_order_events x
+                                  WHERE x.rx_order_id = ${id} AND x.action = 'ack_ward' AND x.at >= e.at)
+                ORDER BY e.at DESC LIMIT 1`;
+            if (!p) return { code: 409 as const };
+            await tx`
+                INSERT INTO rx_order_events (rx_order_id, action, actor, actor_name, detail)
+                VALUES (${id}, 'ack_ward', ${actor.username}, ${actor.fullname}, ${JSON.stringify({ ward: Number(o.ward) })})`;
+            return { code: 200 as const, o };
+        });
+        if (res.code === 404) { set.status = 404; return { success: false, message: 'ไม่พบใบสั่งยานี้' }; }
+        if (res.code === 409) { set.status = 409; return { success: false, message: 'ไม่มีการย้ายตึกที่รอรับทราบ (อาจมีคนกดรับทราบไปแล้ว)' }; }
+        const [w] = await nurse`SELECT ward_name FROM ward WHERE ward = ${res.o.ward}`;
+        emitRxOrder('order:ward', {
+            rx_order_id: String(id), ward: Number(res.o.ward), ward_name: String(w?.ward_name ?? ''),
+            status: String(res.o.status) as RxStatus,
+            priority: String(res.o.priority) as 'routine' | 'discharge' | 'stat',
+            by_name: actor.fullname, at: new Date().toISOString(), ward_ack: true,
+        });
+        return { success: true };
+    } catch (error) {
+        console.error('Ack rx ward error:', error);
+        set.status = 500;
+        return { success: false, message: 'บันทึกการรับทราบไม่สำเร็จ' };
     }
 };
 
