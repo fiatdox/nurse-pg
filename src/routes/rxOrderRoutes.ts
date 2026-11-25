@@ -42,6 +42,8 @@ export const rxOrderRoutes = new Elysia({ prefix: '/api/v1/rx' })
         */
         body: t.Object({
             file: t.Optional(t.File({ type: ['image/jpeg', 'image/png'], maxSize: '12m' })),
+            /* ภาพที่ตัดเฉพาะบริเวณที่ HN มักอยู่ (ขวาล่าง/กลางล่าง) อ่านก่อน ไม่เจอค่อยอ่านทั้งหน้า */
+            roi: t.Optional(t.File({ type: ['image/jpeg', 'image/png'], maxSize: '12m' })),
             candidates: t.Optional(t.String()),
             source: t.Optional(t.String()),
             /* หอที่กำลังส่งใบ ใช้เรียงให้คนที่นอนอยู่หอนี้ขึ้นก่อน ไม่ได้ใช้กรองทิ้ง */

@@ -257,7 +257,7 @@ const verifyAgainstHis = async (candidates: string[], wardCode: string | null) =
 };
 
 export const readRxHn = async ({ body, set }: Context) => {
-    const b = (body ?? {}) as { file?: File; candidates?: string; source?: string; ward?: string };
+    const b = (body ?? {}) as { file?: File; roi?: File; candidates?: string; source?: string; ward?: string };
 
     /* เลขที่ฝั่งหน้าจออ่านมาได้เองจากชั้นข้อความใน PDF หรือจากบาร์โค้ด — แม่นกว่า OCR */
     const given = String(b.candidates ?? '')
@@ -272,55 +272,94 @@ export const readRxHn = async ({ body, set }: Context) => {
     /** เครื่องมือที่ใช้อ่านจริงในคำขอนี้ (paddle ล้มแล้วถอยมา tesseract จะเป็น tesseract) */
     let engine: OcrEngine | null = null;
 
-    if (b.file instanceof File) {
-        if (b.file.size > MAX_IMAGE_BYTES) {
-            set.status = 413;
-            return { success: false, message: 'ภาพใหญ่เกินกว่าที่อ่านได้' };
-        }
-        const buf = Buffer.from(await b.file.arrayBuffer());
+    if (b.file instanceof File && b.file.size > MAX_IMAGE_BYTES) {
+        set.status = 413;
+        return { success: false, message: 'ภาพใหญ่เกินกว่าที่อ่านได้' };
+    }
+    const roiFile = b.roi instanceof File && b.roi.size <= MAX_IMAGE_BYTES ? b.roi : null;
+
+    /*
+      PaddleOCR ตามที่แอดมินตั้งไว้ ถ้าโหลดไม่ขึ้นหรืออ่านพัง ถอยไปใช้ tesseract ในคำขอเดียวกัน
+      พยาบาลไม่ควรต้องพิมพ์ HN เองเพียงเพราะเครื่องมือตัวที่สองมีปัญหา
+    */
+    const ocr = async (file: File): Promise<string> => {
+        const buf = Buffer.from(await file.arrayBuffer());
         const tesseract = () => serialize(async () => {
             const worker = await getWorker();
             const result = await withTimeout(worker.recognize(buf));
             return result.data.text;
         });
-        /*
-          PaddleOCR ตามที่แอดมินตั้งไว้ ถ้าโหลดไม่ขึ้นหรืออ่านพัง ถอยไปใช้ tesseract ในคำขอเดียวกัน
-          พยาบาลไม่ควรต้องพิมพ์ HN เองเพียงเพราะเครื่องมือตัวที่สองมีปัญหา
-        */
-        engine = await rxOcrEngine();
+        if (engine === null) engine = await rxOcrEngine();
         try {
             if (engine === 'paddle') {
                 try {
-                    ocrText = await serialize(() => withTimeout(paddleRecognize(buf)));
+                    return await serialize(() => withTimeout(paddleRecognize(buf)));
                 } catch (error) {
                     /* ข้อความ error ของไลบรารีพ่นซอร์สทั้งไฟล์ออกมา ตัดเหลือบรรทัดที่บอกสาเหตุ */
                     const m = error instanceof Error ? error.message : String(error);
                     console.error('PaddleOCR failed, falling back to tesseract:', m.split('\n').slice(-3).join(' ').slice(0, 300));
                     engine = 'tesseract';
-                    ocrText = await tesseract();
                 }
-            } else {
-                ocrText = await tesseract();
             }
+            return await tesseract();
         } catch (error) {
             const msg = String(error);
             /* ไม่มีไฟล์โมเดล = ยังไม่ได้ติดตั้ง ต่างจากอ่านแล้วไม่เจอ ต้องบอกให้ต่างกัน */
             ocrUnavailable = msg.includes('ENOENT') || msg.includes('traineddata');
             ocrFailed = true;
             console.error('Read rx HN error:', error);
+            return '';
         }
-    }
+    };
 
-    const fromOcr = hnCandidatesFrom(ocrText);
     const fromGiven = hnCandidatesFrom(given.join(' '));
-    const sourceOf = new Map<string, Source>();
-    for (const hn of fromOcr) sourceOf.set(hn, 'ocr');
-    // เลขจากบาร์โค้ด/ชั้นข้อความทับของ OCR เสมอ เพราะไม่ได้มาจากการเดารูปตัวอักษร
-    for (const hn of fromGiven) sourceOf.set(hn, givenSource);
-
-    const candidates = [...sourceOf.keys()].slice(0, MAX_CANDIDATES);
     const wardCode = await hisWardCode(Number(b.ward));
-    const { adm, names, down } = await verifyAgainstHis(candidates, wardCode);
+
+    /*
+      อ่านบริเวณที่ HN มักอยู่ก่อน (ขวาล่าง / กลางล่างของใบ — หน้าจอตัดภาพส่งมาเป็น roi)
+      ภาพที่ตัดแล้วมีตัวเลขอื่น (วันที่ ขนาดยา เลขเตียง) ปนน้อยกว่าทั้งหน้ามาก
+      และสำคัญกว่านั้น: อ่านทั้งหน้า OCR เรียงเลขจากบนลงล่าง HN ที่อยู่ท้ายใบจึงมักตกเพดาน MAX_CANDIDATES
+      เลขจาก roi ได้ที่นั่งก่อนและชนะเมื่อสถานะการนอนเท่ากัน
+      ถ้า roi เจอคนที่ส่งใบจากหอนี้ได้แล้ว ไม่ต้องอ่านทั้งหน้าซ้ำ เร็วขึ้นด้วย
+      ไม่เจอ (ใบรูปแบบอื่น สแกนกลับหัว) ค่อยอ่านทั้งหน้าเหมือนเดิม
+    */
+    const roiHits = new Set<string>();
+    let region: 'roi' | 'full' | null = null;
+    const sourceOf = new Map<string, Source>();
+    let candidates: string[] = [];
+    let verified = await verifyAgainstHis([], wardCode);
+
+    const settle = async (ocrHns: string[]) => {
+        sourceOf.clear();
+        for (const hn of ocrHns) sourceOf.set(hn, 'ocr');
+        // เลขจากบาร์โค้ด/ชั้นข้อความทับของ OCR เสมอ เพราะไม่ได้มาจากการเดารูปตัวอักษร
+        for (const hn of fromGiven) sourceOf.set(hn, givenSource);
+        candidates = [...sourceOf.keys()].slice(0, MAX_CANDIDATES);
+        verified = await verifyAgainstHis(candidates, wardCode);
+    };
+
+    if (roiFile && b.file instanceof File) {
+        region = 'roi';
+        const fromRoi = hnCandidatesFrom(await ocr(roiFile));
+        for (const hn of fromRoi) roiHits.add(hn);
+        await settle(fromRoi);
+        const found = candidates.some(hn => roiHits.has(hn) && verified.adm.get(hn)?.in_ward);
+        if (!found && !ocrUnavailable) {
+            region = 'full';
+            /* roi อ่านพังแต่ทั้งหน้าอ่านได้ ไม่นับว่าล้มเหลว */
+            ocrFailed = false;
+            ocrText = await ocr(b.file);
+            /* เลขจาก roi นำหน้า แล้วต่อด้วยเลขจากทั้งหน้าที่ยังไม่ซ้ำ */
+            await settle([...new Set([...fromRoi, ...hnCandidatesFrom(ocrText)])]);
+        }
+    } else if (b.file instanceof File) {
+        region = 'full';
+        ocrText = await ocr(b.file);
+        await settle(hnCandidatesFrom(ocrText));
+    } else {
+        await settle([]);
+    }
+    const { adm, names, down } = verified;
 
     /*
       เลขที่มีในตารางผู้ป่วยในแต่ไม่มีในทะเบียน ยังคืนไปด้วยแม้ไม่มีชื่อ
@@ -347,7 +386,9 @@ export const readRxHn = async ({ body, set }: Context) => {
             };
         })
         .sort((x, y) => ADMISSION_RANK[x.admission] - ADMISSION_RANK[y.admission]
-            || SOURCE_RANK[x.source] - SOURCE_RANK[y.source]);
+            || SOURCE_RANK[x.source] - SOURCE_RANK[y.source]
+            /* สถานะเท่ากัน เลขที่อยู่ตรงตำแหน่ง HN ของใบน่าเชื่อกว่าเลขที่อยู่กลางใบ */
+            || Number(!roiHits.has(x.hn)) - Number(!roiHits.has(y.hn)));
 
     return {
         success: true,
@@ -358,6 +399,8 @@ export const readRxHn = async ({ body, set }: Context) => {
         ocr_failed: ocrFailed,
         ocr_unavailable: ocrUnavailable,
         ocr_engine: engine,
+        /* อ่านจบที่บริเวณ HN (roi) หรือต้องอ่านทั้งหน้า — ไว้ดูว่าการตัดภาพช่วยได้กี่ใบ */
+        ocr_region: region,
     };
 };
 
