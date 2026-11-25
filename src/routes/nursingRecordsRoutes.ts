@@ -1,6 +1,7 @@
 import { Elysia, t } from 'elysia';
 import { authMiddleware } from '../middlewares/authMiddleware';
 import { getRecordsAnalytics } from '../controllers/recordsAnalyticsController';
+import { getGraphicSheet, saveGraphicShift, saveGraphicDaily } from '../controllers/graphicSheetController';
 import {
     getAdmitRecordByAN,
     saveAdmitRecord,
@@ -180,6 +181,34 @@ export const nursingRecordsRoutes = new Elysia({ prefix: '/api/v1/nursing-record
             wards: t.Optional(t.Array(t.String(), { maxItems: 100 })),
         }),
         detail: { summary: 'ตัวชี้วัดการบริหารยา: ตรงเวลา ขาดมื้อ เหตุผลงดยา ยาความเสี่ยงสูง PRN การตรวจทานคำสั่ง' },
+    })
+
+    // ---------- ฟอร์มปรอท (graphic sheet) ----------
+    .get('/graphic/:an', getGraphicSheet, {
+        params: t.Object({ an: t.String() }),
+        query: t.Object({ from: t.String() }),
+        detail: { summary: 'ฟอร์มปรอท 7 วัน: สัญญาณชีพ ความปวด ยาที่ให้ (จาก MAR) I/O รายเวร และข้อมูลรายวัน' },
+    })
+    .put('/graphic/shift', saveGraphicShift, {
+        body: t.Object({
+            an: t.String({ maxLength: 20 }), record_date: t.String(), shift: t.String(),
+            ward_code: t.Optional(t.Union([t.String({ maxLength: 200 }), t.Null()])), ward_name: t.Optional(t.Union([t.String({ maxLength: 200 }), t.Null()])),
+            oral_ml: t.Optional(t.Union([t.Number(), t.String(), t.Null()])), parenteral_ml: t.Optional(t.Union([t.Number(), t.String(), t.Null()])), intake_other1_label: t.Optional(t.Union([t.String({ maxLength: 200 }), t.Null()])), intake_other1_ml: t.Optional(t.Union([t.Number(), t.String(), t.Null()])),
+            intake_other2_label: t.Optional(t.Union([t.String({ maxLength: 200 }), t.Null()])), intake_other2_ml: t.Optional(t.Union([t.Number(), t.String(), t.Null()])),
+            urine_ml: t.Optional(t.Union([t.Number(), t.String(), t.Null()])), drainage_ml: t.Optional(t.Union([t.Number(), t.String(), t.Null()])), output_other1_label: t.Optional(t.Union([t.String({ maxLength: 200 }), t.Null()])), output_other1_ml: t.Optional(t.Union([t.Number(), t.String(), t.Null()])),
+            output_other2_label: t.Optional(t.Union([t.String({ maxLength: 200 }), t.Null()])), output_other2_ml: t.Optional(t.Union([t.Number(), t.String(), t.Null()])),
+        }),
+        detail: { summary: 'ฟอร์มปรอท: บันทึก/แก้สารน้ำเข้า-ออกของหนึ่งเวร' },
+    })
+    .put('/graphic/daily', saveGraphicDaily, {
+        body: t.Object({
+            an: t.String({ maxLength: 20 }), record_date: t.String(),
+            ward_code: t.Optional(t.Union([t.String({ maxLength: 200 }), t.Null()])), ward_name: t.Optional(t.Union([t.String({ maxLength: 200 }), t.Null()])),
+            stool_count: t.Optional(t.Union([t.Number(), t.String(), t.Null()])), urine_count: t.Optional(t.Union([t.Number(), t.String(), t.Null()])), patient_type: t.Optional(t.Union([t.String({ maxLength: 200 }), t.Null()])),
+            weight_kg: t.Optional(t.Union([t.Number(), t.String(), t.Null()])), height_cm: t.Optional(t.Union([t.Number(), t.String(), t.Null()])), diet: t.Optional(t.Union([t.String({ maxLength: 200 }), t.Null()])),
+            is_operation_day: t.Optional(t.Boolean()), note: t.Optional(t.Union([t.String({ maxLength: 200 }), t.Null()])),
+        }),
+        detail: { summary: 'ฟอร์มปรอท: บันทึก/แก้ข้อมูลรายวัน (stool, ปัสสาวะ, ประเภทผู้ป่วย, Wt/Ht/Diet, วันผ่าตัด)' },
     })
 
     .post('/analytics', getRecordsAnalytics, {
