@@ -1,5 +1,6 @@
 import { Elysia, t } from 'elysia';
 import { authMiddleware } from '../middlewares/authMiddleware';
+import { getRecordsAnalytics } from '../controllers/recordsAnalyticsController';
 import {
     getAdmitRecordByAN,
     saveAdmitRecord,
@@ -179,6 +180,14 @@ export const nursingRecordsRoutes = new Elysia({ prefix: '/api/v1/nursing-record
             wards: t.Optional(t.Array(t.String(), { maxItems: 100 })),
         }),
         detail: { summary: 'ตัวชี้วัดการบริหารยา: ตรงเวลา ขาดมื้อ เหตุผลงดยา ยาความเสี่ยงสูง PRN การตรวจทานคำสั่ง' },
+    })
+
+    .post('/analytics', getRecordsAnalytics, {
+        body: t.Object({
+            date_from: t.String(), date_to: t.String(),
+            wards: t.Optional(t.Array(t.String(), { maxItems: 100 })),
+        }),
+        detail: { summary: 'วิเคราะห์บันทึกทางการพยาบาล: NEWS2 การตอบสนอง ช่องว่างการวัด รหัส NANDA/NIC/NOC Focus list คัดกรองแรกรับ ความปวด' },
     })
 
     // ---------- แบบประเมินความปวด ----------
