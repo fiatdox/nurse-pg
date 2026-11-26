@@ -63,6 +63,15 @@ export const getGraphicSheet = async ({ params, query, set }: Context) => {
               AND a.admin_datetime >= ${start}::text::timestamp
               AND a.admin_datetime < ${start}::text::timestamp + INTERVAL '7 days'
             ORDER BY a.admin_datetime`;
+        /* ความปวดจากหน้าแบบประเมินความปวด (ลงรายละเอียด) — วาดรวมกับคะแนนจากสัญญาณชีพ */
+        const pains = await nurse`
+            SELECT TO_CHAR(record_datetime, 'YYYY-MM-DD"T"HH24:MI:SS') AS at,
+                   pain_score, reassess_score, location, assessment_tool
+            FROM nursing_pain_records
+            WHERE an = ${an} AND is_deleted IS NOT TRUE AND pain_score IS NOT NULL
+              AND record_datetime >= ${start}::text::timestamp
+              AND record_datetime < ${start}::text::timestamp + INTERVAL '7 days'
+            ORDER BY record_datetime`;
 
         let shifts: Record<string, unknown>[] = [];
         let daily: Record<string, unknown>[] = [];
@@ -95,7 +104,7 @@ export const getGraphicSheet = async ({ params, query, set }: Context) => {
 
         return {
             success: true,
-            data: { from, vitals, meds, shifts, daily, op_dates: opDates, storage_ready: storageReady },
+            data: { from, vitals, meds, pains, shifts, daily, op_dates: opDates, storage_ready: storageReady },
         };
     } catch (error) {
         console.error('Get graphic sheet error:', error);

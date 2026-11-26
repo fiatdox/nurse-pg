@@ -37,7 +37,31 @@ const levelOfScore = (score: number): string => {
     return 'worst';
 };
 
-const VALID_TOOLS = ['NRS', 'VAS', 'Wong-Baker', 'FLACC', 'BPS'];
+const VALID_TOOLS = ['NRS', 'VAS', 'Wong-Baker', 'FLACC', 'BPS', 'CPOT'];
+
+/**
+ * CPOT (Critical-Care Pain Observation Tool) ฉบับภาษาไทย — สำหรับผู้ป่วยที่บอกคะแนนความปวดเองไม่ได้
+ * 4 ด้าน ด้านละ 0-2 รวม 0-8 · 0-2 mild · 3-5 moderate · >5 severe (ศิริราช 2564)
+ * ด้านที่ 4 เลือกตามการใส่ท่อช่วยหายใจ: การยอมตามเครื่อง (ventilator) หรือการออกเสียง (vocal)
+ */
+const CPOT_KEYS = ['facial', 'body', 'muscle', 'airway'] as const;
+const cpotLevel = (total: number): string => (total <= 2 ? 'mild' : total <= 5 ? 'moderate' : 'severe');
+const parseCpot = (raw: unknown): { items: Record<string, unknown>; total: number } | string => {
+    const o = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+    const mode = String(o.airway_mode ?? '');
+    if (mode !== 'ventilator' && mode !== 'vocal') return 'กรุณาเลือกว่าผู้ป่วยใส่ท่อช่วยหายใจหรือไม่ (ด้านที่ 4)';
+    const items: Record<string, unknown> = { airway_mode: mode };
+    let total = 0;
+    for (const k of CPOT_KEYS) {
+        const n = Number(o[k]);
+        if (o[k] === null || o[k] === undefined || o[k] === '' || !Number.isInteger(n) || n < 0 || n > 2) {
+            return 'CPOT ต้องให้คะแนนครบทั้ง 4 ด้าน ด้านละ 0-2';
+        }
+        items[k] = n;
+        total += n;
+    }
+    return { items, total };
+};
 
 // ---------- ดึงรายการประเมินความปวดตาม AN ----------
 export const getPainRecordsByAN = async ({ params, query, set }: Context) => {
@@ -93,24 +117,36 @@ export const savePainRecord = async ({ body, set, user }: Context & { user: any 
         return { success: false, message: 'กรุณาระบุชื่อพยาบาลผู้ประเมิน' };
     }
 
-    const score = Number(payload.pain_score);
-    if (!Number.isInteger(score) || score < 0 || score > 10) {
+    const tool = String(payload.assessment_tool ?? 'NRS').trim() || 'NRS';
+    if (!VALID_TOOLS.includes(tool)) {
         set.status = 400;
-        return { success: false, message: 'คะแนนความปวดต้องเป็นจำนวนเต็ม 0–10' };
+        return { success: false, message: 'เครื่องมือประเมินไม่ถูกต้อง' };
+    }
+
+    // CPOT: คะแนนรวมคำนวณที่ server จากรายด้าน ไม่เชื่อ pain_score ที่ส่งมา
+    let cpot: { items: Record<string, unknown>; total: number } | null = null;
+    if (tool === 'CPOT') {
+        const r = parseCpot(payload.tool_items);
+        if (typeof r === 'string') {
+            set.status = 400;
+            return { success: false, message: r };
+        }
+        cpot = r;
+    }
+    const maxScore = cpot ? 8 : 10;
+
+    const score = cpot ? cpot.total : Number(payload.pain_score);
+    if (!Number.isInteger(score) || score < 0 || score > maxScore) {
+        set.status = 400;
+        return { success: false, message: `คะแนนความปวดต้องเป็นจำนวนเต็ม 0–${maxScore}` };
     }
 
     const reassess = payload.reassess_score;
     const reassessScore =
         reassess === null || reassess === undefined || reassess === '' ? null : Number(reassess);
-    if (reassessScore !== null && (!Number.isInteger(reassessScore) || reassessScore < 0 || reassessScore > 10)) {
+    if (reassessScore !== null && (!Number.isInteger(reassessScore) || reassessScore < 0 || reassessScore > maxScore)) {
         set.status = 400;
-        return { success: false, message: 'คะแนนหลังประเมินซ้ำต้องเป็นจำนวนเต็ม 0–10' };
-    }
-
-    const tool = String(payload.assessment_tool ?? 'NRS').trim() || 'NRS';
-    if (!VALID_TOOLS.includes(tool)) {
-        set.status = 400;
-        return { success: false, message: 'เครื่องมือประเมินไม่ถูกต้อง' };
+        return { success: false, message: `คะแนนหลังประเมินซ้ำต้องเป็นจำนวนเต็ม 0–${maxScore}` };
     }
 
     const recordDatetime = toLocalDate(payload.record_datetime) ?? new Date();
@@ -130,8 +166,10 @@ export const savePainRecord = async ({ body, set, user }: Context & { user: any 
     values.shift = shift;
     values.assessment_tool = tool;
     values.pain_score = score;
-    values.pain_level = levelOfScore(score);
+    values.pain_level = cpot ? cpotLevel(score) : levelOfScore(score);
     values.reassess_score = reassessScore;
+    // ใส่คอลัมน์นี้เฉพาะ CPOT — เครื่องมืออื่นยังบันทึกได้แม้ยังไม่ได้รัน sql เพิ่มคอลัมน์
+    if (cpot) values.tool_items = nurse.json(cpot.items as never);
 
     try {
         // ทุกครั้งที่ประเมินคือแถวใหม่ ประวัติความปวดต้องเห็นแนวโน้มย้อนหลังได้
@@ -151,6 +189,12 @@ export const savePainRecord = async ({ body, set, user }: Context & { user: any 
             data: sanitizeRow(saved[0] as Record<string, unknown>),
         };
     } catch (error) {
+        // ยังไม่ได้รัน sql/2026-11-26_pain_cpot.sql: ไม่มีคอลัมน์ tool_items หรือ CHECK ยังไม่รับ CPOT
+        const code = (error as { code?: string })?.code;
+        if (cpot && (code === '42703' || code === '23514')) {
+            set.status = 503;
+            return { success: false, message: 'ฐานข้อมูลยังไม่รองรับ CPOT (ต้องรัน sql/2026-11-26_pain_cpot.sql)' };
+        }
         console.error('Save pain record error:', error);
         set.status = 500;
         return { success: false, message: 'Internal Server Error' };
