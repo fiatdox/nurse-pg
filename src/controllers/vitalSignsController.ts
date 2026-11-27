@@ -169,6 +169,101 @@ export const getVitalRecordsByAN = async ({ params, query, set }: Context) => {
     }
 };
 
+/**
+ * ตรวจค่าจากฟอร์ม (ช่วงค่า enum ความยาว ความดัน ออกซิเจน เวลาในอนาคต เหตุผลลงย้อนหลัง)
+ * ใช้ร่วมกันทั้งบันทึกใหม่และแก้ไข · enteredAt = เวลาที่ลงเข้าระบบ (ใหม่ = ตอนนี้, แก้ไข = เวลาที่ลงครั้งแรก)
+ * คืน string = ข้อความผิดพลาด (400)
+ */
+const validateVital = (payload: Record<string, unknown>, an: string, enteredAt: Date):
+    { values: Record<string, unknown>; onOxygen: boolean; sbp: number | null; recordDatetime: Date; reason: string } | string => {
+    // รับเฉพาะคอลัมน์ที่รู้จัก ค่าว่างเป็น null ให้ตรงกับชนิดคอลัมน์
+    const values: Record<string, unknown> = {};
+    for (const f of VITAL_FIELDS) {
+        const v = payload[f];
+        values[f] = v === undefined || v === '' ? null : v;
+    }
+
+    // ตรวจช่วงค่าก่อนถึงฐานข้อมูล เพื่อบอกได้ว่าฟิลด์ไหนผิด
+    for (const [field, [min, max, mustBeInt]] of Object.entries(RANGES)) {
+        const raw = values[field];
+        if (raw === null) continue;
+        const n = Number(raw);
+        if (!Number.isFinite(n) || n < min || n > max || (mustBeInt && !Number.isInteger(n))) {
+            const kind = mustBeInt ? 'จำนวนเต็ม' : 'ตัวเลข';
+            return `${LABELS[field] ?? field} ต้องเป็น${kind} ${min}–${max}`;
+        }
+        values[field] = n;
+    }
+
+    // ค่า enum ต้องตรงกับที่ฐานข้อมูลยอมรับ
+    for (const [field, allowed] of Object.entries(ENUMS)) {
+        const raw = values[field];
+        if (raw === null) continue;
+        if (!allowed.includes(String(raw))) return `${LABELS[field] ?? field} มีค่าไม่ถูกต้อง`;
+    }
+
+    // ความยาวข้อความต้องไม่เกินขนาดคอลัมน์
+    for (const [field, max] of Object.entries(MAX_LENGTH)) {
+        const raw = field === 'an' ? an : values[field];
+        if (raw === null || raw === undefined) continue;
+        if (String(raw).length > max) return `${LABELS[field] ?? field} ยาวเกิน ${max} ตัวอักษร`;
+    }
+
+    const sbp = values.vital_bp_s as number | null;
+    const dbp = values.vital_bp_d as number | null;
+    if (sbp !== null && dbp !== null && dbp >= sbp) return 'ความดันตัวล่างต้องน้อยกว่าตัวบน';
+    if ((sbp === null) !== (dbp === null)) return 'กรุณากรอกความดันทั้งตัวบนและตัวล่าง';
+
+    // ให้ออกซิเจนแล้วต้องรู้ว่าอุปกรณ์อะไร ไม่งั้นค่า SpO₂ ตีความไม่ได้
+    const onOxygen = values.o2_therapy === 'on_oxygen';
+    if (onOxygen && !values.o2_device) return 'ระบุออกซิเจนแล้ว กรุณาเลือกอุปกรณ์ที่ใช้';
+    if (!onOxygen) {
+        values.o2_device = null;
+        values.o2_flow = null;
+        values.fio2 = null;
+    }
+
+    const now = new Date();
+    const recordDatetime = toLocalDate(values.record_datetime) ?? now;
+
+    // เวลาวัดล่วงหน้าเป็นไปไม่ได้ กันพิมพ์วันที่ผิด
+    if (recordDatetime.getTime() - now.getTime() > 5 * 60 * 1000) return 'เวลาที่วัดต้องไม่เป็นเวลาในอนาคต';
+
+    const backdatedHours = (enteredAt.getTime() - recordDatetime.getTime()) / 3600000;
+    const reason = String(values.late_entry_reason ?? '').trim();
+    if (backdatedHours > REASON_REQUIRED_HOURS && reason.length < 5) {
+        return `บันทึกย้อนหลังเกิน ${REASON_REQUIRED_HOURS} ชั่วโมง กรุณาระบุเหตุผล`;
+    }
+    return { values, onOxygen, sbp, recordDatetime, reason };
+};
+
+/** NEWS2 ใช้กับผู้ใหญ่เท่านั้น เด็กต้องใช้ PEWS ซึ่งเกณฑ์คนละชุด — เติมคอลัมน์ news2_* / อายุ ลงใน values */
+const applyNews2 = async (an: string, values: Record<string, unknown>, onOxygen: boolean, sbp: number | null) => {
+    const ageYears = await fetchAgeYears(an);
+    const news2Scale = Number(values.news2_scale) === 2 ? 2 : 1;
+    const news2 =
+        ageYears !== null && ageYears >= NEWS2_MIN_AGE
+            ? calcNews2({
+                  resp_rate: values.vital_r as number | null,
+                  spo2: values.vital_o2sat as number | null,
+                  on_oxygen: onOxygen,
+                  temperature: values.vital_t as number | null,
+                  systolic_bp: sbp,
+                  pulse: values.vital_p as number | null,
+                  avpu: (values.avpu as Avpu) ?? null,
+                  scale: news2Scale,
+              })
+            : null;
+    values.patient_age_years = ageYears === null ? null : Math.floor(ageYears);
+    values.age_group = ageGroupOf(ageYears);
+    values.news2_scale = news2 ? news2Scale : null;
+    values.news2_score = news2?.score ?? null;
+    values.news2_risk = news2?.risk ?? null;
+    values.news2_breakdown = news2 ? nurse.json(news2 as never) : null;
+    values.monitor_freq = news2?.monitorFreq ?? null;
+    return news2;
+};
+
 // ---------- บันทึกสัญญาณชีพ ----------
 export const saveVitalRecord = async ({ body, set, user }: Context & { user: any }) => {
     const payload = (body ?? {}) as Record<string, unknown>;
@@ -212,87 +307,13 @@ export const saveVitalRecord = async ({ body, set, user }: Context & { user: any
         return { success: false, message: 'ไม่พบบัญชีผู้ใช้ที่เข้าสู่ระบบ กรุณาเข้าสู่ระบบใหม่' };
     }
 
-    // รับเฉพาะคอลัมน์ที่รู้จัก ค่าว่างเป็น null ให้ตรงกับชนิดคอลัมน์
-    const values: Record<string, unknown> = {};
-    for (const f of VITAL_FIELDS) {
-        const v = payload[f];
-        values[f] = v === undefined || v === '' ? null : v;
-    }
-
-    // ตรวจช่วงค่าก่อนถึงฐานข้อมูล เพื่อบอกได้ว่าฟิลด์ไหนผิด
-    for (const [field, [min, max, mustBeInt]] of Object.entries(RANGES)) {
-        const raw = values[field];
-        if (raw === null) continue;
-        const n = Number(raw);
-        if (!Number.isFinite(n) || n < min || n > max || (mustBeInt && !Number.isInteger(n))) {
-            set.status = 400;
-            const kind = mustBeInt ? 'จำนวนเต็ม' : 'ตัวเลข';
-            return { success: false, message: `${LABELS[field] ?? field} ต้องเป็น${kind} ${min}–${max}` };
-        }
-        values[field] = n;
-    }
-
-    // ค่า enum ต้องตรงกับที่ฐานข้อมูลยอมรับ
-    for (const [field, allowed] of Object.entries(ENUMS)) {
-        const raw = values[field];
-        if (raw === null) continue;
-        if (!allowed.includes(String(raw))) {
-            set.status = 400;
-            return { success: false, message: `${LABELS[field] ?? field} มีค่าไม่ถูกต้อง` };
-        }
-    }
-
-    // ความยาวข้อความต้องไม่เกินขนาดคอลัมน์
-    for (const [field, max] of Object.entries(MAX_LENGTH)) {
-        const raw = field === 'an' ? an : values[field];
-        if (raw === null || raw === undefined) continue;
-        if (String(raw).length > max) {
-            set.status = 400;
-            return { success: false, message: `${LABELS[field] ?? field} ยาวเกิน ${max} ตัวอักษร` };
-        }
-    }
-
-    const sbp = values.vital_bp_s as number | null;
-    const dbp = values.vital_bp_d as number | null;
-    if (sbp !== null && dbp !== null && dbp >= sbp) {
-        set.status = 400;
-        return { success: false, message: 'ความดันตัวล่างต้องน้อยกว่าตัวบน' };
-    }
-    if ((sbp === null) !== (dbp === null)) {
-        set.status = 400;
-        return { success: false, message: 'กรุณากรอกความดันทั้งตัวบนและตัวล่าง' };
-    }
-
-    // ให้ออกซิเจนแล้วต้องรู้ว่าอุปกรณ์อะไร ไม่งั้นค่า SpO₂ ตีความไม่ได้
-    const onOxygen = values.o2_therapy === 'on_oxygen';
-    if (onOxygen && !values.o2_device) {
-        set.status = 400;
-        return { success: false, message: 'ระบุออกซิเจนแล้ว กรุณาเลือกอุปกรณ์ที่ใช้' };
-    }
-    if (!onOxygen) {
-        values.o2_device = null;
-        values.o2_flow = null;
-        values.fio2 = null;
-    }
-
     const now = new Date();
-    const recordDatetime = toLocalDate(values.record_datetime) ?? now;
-
-    // เวลาวัดล่วงหน้าเป็นไปไม่ได้ กันพิมพ์วันที่ผิด
-    if (recordDatetime.getTime() - now.getTime() > 5 * 60 * 1000) {
+    const checked = validateVital(payload, an, now);
+    if (typeof checked === 'string') {
         set.status = 400;
-        return { success: false, message: 'เวลาที่วัดต้องไม่เป็นเวลาในอนาคต' };
+        return { success: false, message: checked };
     }
-
-    const backdatedHours = (now.getTime() - recordDatetime.getTime()) / 3600000;
-    const reason = String(values.late_entry_reason ?? '').trim();
-    if (backdatedHours > REASON_REQUIRED_HOURS && reason.length < 5) {
-        set.status = 400;
-        return {
-            success: false,
-            message: `บันทึกย้อนหลังเกิน ${REASON_REQUIRED_HOURS} ชั่วโมง กรุณาระบุเหตุผล`,
-        };
-    }
+    const { values, onOxygen, sbp, recordDatetime, reason } = checked;
 
     // ผู้ป่วยหนึ่งคนมีสัญญาณชีพของเวลาเดียวกันได้ครั้งเดียว
     // ดักไว้ก่อนเพื่อบอกได้ว่าใครบันทึกไว้ ไม่ปล่อยให้ไปชน unique index แล้วได้ข้อความดิบ
@@ -326,24 +347,7 @@ export const saveVitalRecord = async ({ body, set, user }: Context & { user: any
         };
     }
 
-    const ageYears = await fetchAgeYears(an);
-    const ageGroup = ageGroupOf(ageYears);
-
-    // NEWS2 ใช้กับผู้ใหญ่เท่านั้น เด็กต้องใช้ PEWS ซึ่งเกณฑ์คนละชุด
-    const news2Scale = Number(values.news2_scale) === 2 ? 2 : 1;
-    const news2 =
-        ageYears !== null && ageYears >= NEWS2_MIN_AGE
-            ? calcNews2({
-                  resp_rate: values.vital_r as number | null,
-                  spo2: values.vital_o2sat as number | null,
-                  on_oxygen: onOxygen,
-                  temperature: values.vital_t as number | null,
-                  systolic_bp: sbp,
-                  pulse: values.vital_p as number | null,
-                  avpu: (values.avpu as Avpu) ?? null,
-                  scale: news2Scale,
-              })
-            : null;
+    const news2 = await applyNews2(an, values, onOxygen, sbp);
 
     values.nurse_name = actor.fullname;
     values.staff_id = actor.userId;
@@ -352,13 +356,6 @@ export const saveVitalRecord = async ({ body, set, user }: Context & { user: any
     values.late_entry_reason = reason || null;
     values.entry_method = values.entry_method === 'monitor_import' ? 'monitor_import' : 'manual';
     values.entered_at = now;
-    values.patient_age_years = ageYears === null ? null : Math.floor(ageYears);
-    values.age_group = ageGroup;
-    values.news2_scale = news2 ? news2Scale : null;
-    values.news2_score = news2?.score ?? null;
-    values.news2_risk = news2?.risk ?? null;
-    values.news2_breakdown = news2 ? nurse.json(news2 as never) : null;
-    values.monitor_freq = news2?.monitorFreq ?? null;
 
     try {
         // ทุกครั้งที่วัดคือแถวใหม่ ต้องเห็นแนวโน้มย้อนหลังได้
@@ -409,6 +406,107 @@ export const saveVitalRecord = async ({ body, set, user }: Context & { user: any
         }
 
         console.error('Save vital record error:', error);
+        set.status = 500;
+        return { success: false, message: 'Internal Server Error' };
+    }
+};
+
+// ---------- แก้ไขสัญญาณชีพ ----------
+/**
+ * แก้แถวเดิม (ลงค่าผิด ลืมกรอกบางช่อง) — ไม่สร้างแถวใหม่ กราฟจะไม่มีจุดซ้ำ
+ * ผู้วัด (nurse_name/staff_id) และเวลาที่ลงเข้าระบบครั้งแรก (entered_at) คงเดิม ผู้แก้เก็บที่ updated_by/updated_at
+ * ต้องส่ง an มาและต้องตรงกับแถว กันแก้ผิดคน · คำนวณ NEWS2 และเวรใหม่จากค่าที่แก้
+ */
+export const updateVitalRecord = async ({ params, body, set, user }: Context & { user: any }) => {
+    const recordId = Number((params as { id: string }).id);
+    if (!Number.isInteger(recordId) || recordId <= 0) {
+        set.status = 400;
+        return { success: false, message: 'id ไม่ถูกต้อง' };
+    }
+    const payload = (body ?? {}) as Record<string, unknown>;
+    const an = String(payload.an ?? '').trim();
+    if (!an) {
+        set.status = 400;
+        return { success: false, message: 'กรุณาระบุ an' };
+    }
+
+    const actor = await resolveActor(user);
+    if (!actor) {
+        set.status = 401;
+        return { success: false, message: 'ไม่พบบัญชีผู้ใช้ที่เข้าสู่ระบบ กรุณาเข้าสู่ระบบใหม่' };
+    }
+
+    try {
+        const found = await nurse`
+            SELECT id, entered_at, created_at, staff_id, nurse_name, ward_code, ward_name
+            FROM nursing_vital_records
+            WHERE id = ${recordId} AND an = ${an} AND is_deleted IS NOT TRUE
+            LIMIT 1
+        `;
+        if (found.length === 0) {
+            set.status = 404;
+            return { success: false, message: 'ไม่พบรายการที่ต้องการแก้ไข (อาจถูกลบไปแล้ว)' };
+        }
+        const orig = found[0] as Record<string, unknown>;
+        const enteredAt = orig.entered_at instanceof Date ? orig.entered_at
+            : orig.created_at instanceof Date ? orig.created_at : new Date();
+
+        // หอของแถวเดิมใช้แทนได้ถ้าหน้าจอไม่ได้ส่งมา (ผู้ป่วยย้ายหอแล้วกลับมาแก้ค่าเก่า)
+        const checked = validateVital(
+            { ...payload, ward_code: payload.ward_code || orig.ward_code, ward_name: payload.ward_name || orig.ward_name },
+            an, enteredAt,
+        );
+        if (typeof checked === 'string') {
+            set.status = 400;
+            return { success: false, message: checked };
+        }
+        const { values, onOxygen, sbp, recordDatetime, reason } = checked;
+
+        // เวลาเดียวกันมีได้แถวเดียว (ไม่นับแถวที่กำลังแก้)
+        const clash = await nurse`
+            SELECT id, nurse_name FROM nursing_vital_records
+            WHERE an = ${an} AND record_datetime = ${recordDatetime}
+              AND id <> ${recordId} AND is_deleted IS NOT TRUE
+            LIMIT 1
+        `;
+        if (clash.length > 0) {
+            set.status = 409;
+            const by = String((clash[0] as Record<string, unknown>).nurse_name ?? '').trim();
+            return {
+                success: false,
+                message: `มีบันทึกสัญญาณชีพของเวลานี้อยู่แล้ว${by ? ` (บันทึกโดย ${by})` : ''} กรุณาแก้เวลาที่วัด`,
+                existing_id: (clash[0] as Record<string, unknown>).id,
+            };
+        }
+
+        const news2 = await applyNews2(an, values, onOxygen, sbp);
+        values.record_datetime = recordDatetime;
+        values.shift = shiftOfTime(recordDatetime);
+        values.late_entry_reason = reason || null;
+        values.entry_method = values.entry_method === 'monitor_import' ? 'monitor_import' : 'manual';
+
+        const saved = await nurse`
+            UPDATE nursing_vital_records
+            SET ${nurse({ ...values, updated_at: new Date(), updated_by: actor.username })}
+            WHERE id = ${recordId} AND an = ${an} AND is_deleted IS NOT TRUE
+            RETURNING *
+        `;
+        if (saved.length === 0) {
+            set.status = 404;
+            return { success: false, message: 'ไม่พบรายการที่ต้องการแก้ไข (อาจถูกลบไปแล้ว)' };
+        }
+        return {
+            success: true,
+            message: 'แก้ไขสัญญาณชีพเรียบร้อยแล้ว',
+            data: sanitizeRow(saved[0] as Record<string, unknown>),
+            news2,
+        };
+    } catch (error) {
+        if ((error as { code?: string })?.code === '23505') {
+            set.status = 409;
+            return { success: false, message: 'มีบันทึกสัญญาณชีพของเวลานี้อยู่แล้ว กรุณาแก้เวลาที่วัด' };
+        }
+        console.error('Update vital record error:', error);
         set.status = 500;
         return { success: false, message: 'Internal Server Error' };
     }

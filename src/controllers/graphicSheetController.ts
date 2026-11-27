@@ -73,6 +73,21 @@ export const getGraphicSheet = async ({ params, query, set }: Context) => {
               AND record_datetime < ${start}::text::timestamp + INTERVAL '7 days'
             ORDER BY record_datetime`;
 
+        /* ความเสี่ยงพลัดตกหกล้ม (Morse) วันละครั้ง — แถวสุดท้ายของใบ · ยังไม่มีตารางก็แสดงใบได้ตามปกติ */
+        let falls: Record<string, unknown>[] = [];
+        try {
+            falls = await nurse`
+                SELECT TO_CHAR(record_datetime, 'YYYY-MM-DD"T"HH24:MI:SS') AS at,
+                       total_score, risk_level, nurse_name
+                FROM nursing_assessments
+                WHERE an = ${an} AND assessment_type = 'fall_risk' AND is_deleted IS NOT TRUE
+                  AND record_datetime >= ${start}::text::timestamp
+                  AND record_datetime < ${start}::text::timestamp + INTERVAL '7 days'
+                ORDER BY record_datetime`;
+        } catch (e) {
+            if (!missingTable(e)) throw e;
+        }
+
         let shifts: Record<string, unknown>[] = [];
         let daily: Record<string, unknown>[] = [];
         let opDates: string[] = [];
@@ -104,7 +119,7 @@ export const getGraphicSheet = async ({ params, query, set }: Context) => {
 
         return {
             success: true,
-            data: { from, vitals, meds, pains, shifts, daily, op_dates: opDates, storage_ready: storageReady },
+            data: { from, vitals, meds, pains, falls, shifts, daily, op_dates: opDates, storage_ready: storageReady },
         };
     } catch (error) {
         console.error('Get graphic sheet error:', error);

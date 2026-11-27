@@ -10,11 +10,20 @@ import {
     getPainRecordsByAN,
     savePainRecord,
     deletePainRecord,
+    updatePainRecord,
 } from '../controllers/painController';
+import {
+    getFallRiskByAN,
+    saveFallRisk,
+    updateFallRisk,
+    deleteFallRisk,
+} from '../controllers/fallRiskController';
+import { getRrtByAN, saveRrt, updateRrt, deleteRrt } from '../controllers/rrtController';
 import {
     getVitalRecordsByAN,
     saveVitalRecord,
     deleteVitalRecord,
+    updateVitalRecord,
 } from '../controllers/vitalSignsController';
 import {
     getProgressNotesByAN,
@@ -101,6 +110,12 @@ export const nursingRecordsRoutes = new Elysia({ prefix: '/api/v1/nursing-record
             { additionalProperties: true }
         ),
         detail: { summary: 'บันทึกสัญญาณชีพ (ผู้บันทึกจาก token, คำนวณ MAP / PP / NEWS2 อัตโนมัติ)' },
+    })
+    // แก้แถวเดิม: ผู้วัดคงเดิม ผู้แก้มาจาก token · คำนวณ NEWS2 ใหม่
+    .put('/vital/:id', updateVitalRecord, {
+        params: t.Object({ id: t.String() }),
+        body: t.Object({ an: t.String() }, { additionalProperties: true }),
+        detail: { summary: 'แก้ไขสัญญาณชีพ (แถวเดิม ต้องตรง an, คำนวณ NEWS2 ใหม่)' },
     })
     .delete('/vital/:id', deleteVitalRecord, {
         params: t.Object({ id: t.String() }),
@@ -238,9 +253,62 @@ export const nursingRecordsRoutes = new Elysia({ prefix: '/api/v1/nursing-record
         ),
         detail: { summary: 'บันทึกการประเมินความปวด' },
     })
+    .put('/pain/:id', updatePainRecord, {
+        params: t.Object({ id: t.String() }),
+        body: t.Object(
+            {
+                an: t.String(),
+                ward_code: t.String(),
+                nurse_name: t.String(),
+                pain_score: t.Number(),
+            },
+            { additionalProperties: true }
+        ),
+        detail: { summary: 'แก้ไขการประเมินความปวด (แถวเดิม ต้องตรง an)' },
+    })
     .delete('/pain/:id', deletePainRecord, {
         params: t.Object({ id: t.String() }),
         detail: { summary: 'ลบการประเมินความปวด (soft delete)' },
+    })
+
+    // ---------- แบบประเมินความเสี่ยงพลัดตกหกล้ม (Morse Fall Scale) ----------
+    // เก็บใน nursing_assessments · วันละ 1 ครั้งต่อ AN (วันเดิมให้แก้รายการเดิม) · คะแนนคำนวณที่ server
+    .get('/fall-risk/:an', getFallRiskByAN, {
+        params: t.Object({ an: t.String() }),
+        detail: { summary: 'ดึงการประเมิน Morse Fall Scale ตาม AN (ใหม่สุดก่อน)' },
+    })
+    .post('/fall-risk', saveFallRisk, {
+        body: t.Object({ an: t.String(), ward_code: t.String() }, { additionalProperties: true }),
+        detail: { summary: 'บันทึกการประเมิน Morse Fall Scale (วันละ 1 ครั้ง)' },
+    })
+    .put('/fall-risk/:id', updateFallRisk, {
+        params: t.Object({ id: t.String() }),
+        body: t.Object({ an: t.String(), ward_code: t.String() }, { additionalProperties: true }),
+        detail: { summary: 'แก้ไขการประเมิน Morse Fall Scale (แถวเดิม ต้องตรง an)' },
+    })
+    .delete('/fall-risk/:id', deleteFallRisk, {
+        params: t.Object({ id: t.String() }),
+        detail: { summary: 'ลบการประเมิน Morse Fall Scale (soft delete)' },
+    })
+
+    // ---------- การตามทีม RRT (NEWS2 ≥ 5) และคัดกรอง sepsis (qSOFA) ----------
+    // ผู้บันทึกมาจาก token · NEWS2/qSOFA เอาจากสัญญาณชีพที่อ้างถึง ไม่รับจาก client
+    .get('/rrt/:an', getRrtByAN, {
+        params: t.Object({ an: t.String() }),
+        detail: { summary: 'บันทึกการตาม RRT + สัญญาณชีพที่ถึงเกณฑ์ (NEWS2 ≥ 5) และรายการที่ยังไม่มีบันทึก' },
+    })
+    .post('/rrt', saveRrt, {
+        body: t.Object({ an: t.String() }, { additionalProperties: true }),
+        detail: { summary: 'บันทึกการตาม RRT (ตาม/ไม่ได้ตามพร้อมเหตุผล, เวลาทีมมาถึง, ผลลัพธ์, คัดกรอง sepsis)' },
+    })
+    .put('/rrt/:id', updateRrt, {
+        params: t.Object({ id: t.String() }),
+        body: t.Object({ an: t.String() }, { additionalProperties: true }),
+        detail: { summary: 'แก้ไขบันทึกการตาม RRT (แถวเดิม ต้องตรง an)' },
+    })
+    .delete('/rrt/:id', deleteRrt, {
+        params: t.Object({ id: t.String() }),
+        detail: { summary: 'ลบบันทึกการตาม RRT (soft delete)' },
     })
 
     // ---------- บันทึกทางการพยาบาล (Progress Notes) ----------

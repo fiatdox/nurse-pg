@@ -63,6 +63,8 @@ const DISCHARGE_GRACE_DAYS = 7;
 /** การนอนครั้งล่าสุดของเลขหนึ่ง */
 interface AdmissionInfo {
     an: string | null;
+    /** เตียงของการนอนครั้งนี้ (iptadm.bedno) ว่าง = ไม่รู้ / จำหน่ายนานแล้ว */
+    bedno: string | null;
     ward_name: string | null;
     admission: Admission;
     /** วันจำหน่าย รูปแบบ YYYY-MM-DD ว่าง = ยังนอนอยู่ */
@@ -133,8 +135,40 @@ const serialize = <T>(task: () => Promise<T>): Promise<T> => {
  * เลขสั้นกว่าเก้าหลักเติมศูนย์หน้าให้ เลขยาวกว่าลองทั้งหัวและท้าย
  * (ตัวเลขสองก้อนที่อยู่ติดกันมักถูกอ่านรวมเป็นก้อนเดียว)
  */
-export const hnCandidatesFrom = (text: string): string[] => {
+/**
+ * เลขที่ตามหลังคำว่า HN บนใบ (HN 000123456 / HN: 123456 / H.N. 000123456)
+ * ใบส่วนใหญ่ของที่นี่พิมพ์ HN แบบนี้ เป็นหลักฐานที่ชัดที่สุดว่าเลขไหนคือ HN
+ * เห็นได้เฉพาะ PaddleOCR — tesseract ตั้งให้อ่านแค่ตัวเลข จึงไม่เห็นคำว่า HN (ใช้รูปแบบ 000XXXXXX ข้างล่างแทน)
+ * OCR มักอ่านศูนย์เป็นตัว O จึงแปลง O/o ในเลขหลังคำว่า HN เป็น 0
+ */
+const HN_LABEL = /(?<![A-Za-z])H\.?\s?N\.?\s*(?:[:#-]\s*)?([0-9Oo]{4,14})(?![0-9])/gi;
+export const labeledHnsFrom = (text: string): string[] => {
     const out: string[] = [];
+    for (const m of text.matchAll(HN_LABEL)) {
+        const raw = m[1] ?? '';
+        /* ต้องมีตัวเลขจริงอย่างน้อย 3 ตัว กันคำที่ขึ้นต้นด้วย O ต่อท้าย HN */
+        if ((raw.match(/\d/g) ?? []).length < 3) continue;
+        const run = raw.replace(/[Oo]/g, '0');
+        /* ยาวเกิน = OCR ต่อเลขถัดไปเข้ามา เลขที่ติดคำว่า HN คือส่วนหัว */
+        out.push(run.length <= HN_LENGTH ? padHn(run) : run.slice(0, HN_LENGTH));
+    }
+    return [...new Set(out)].filter(hn => !/^0+$/.test(hn));
+};
+
+/**
+ * HN เต็มรูปแบบที่พิมพ์บนใบ: 000 ตามด้วยเลขหกหลัก (000123456)
+ * วันที่ ขนาดยา เลขเตียง ไม่ขึ้นต้นด้วย 000 และยาวเก้าหลักพอดี จึงเชื่อได้กว่าเลขลอย ๆ มาก
+ * ใช้ได้กับ OCR ทั้งสองตัว (tesseract ที่อ่านแค่ตัวเลขก็เห็น)
+ */
+const FULL_HN = /(?<!\d)000\d{6}(?!\d)/g;
+
+/** เลขที่น่าจะเป็น HN จริง (ติดคำว่า HN หรือเป็นรูปแบบ 000XXXXXX) — ได้ที่นั่งก่อนและชนะเมื่อสถานะการนอนเท่ากัน */
+export const strongHnsFrom = (text: string): string[] =>
+    [...new Set([...labeledHnsFrom(text), ...[...text.matchAll(FULL_HN)].map(m => m[0])])];
+
+export const hnCandidatesFrom = (text: string): string[] => {
+    /* เลขที่น่าจะเป็น HN จริงขึ้นก่อน ไม่ตกเพดาน MAX_CANDIDATES เพราะมีเลขอื่นบนใบมาก่อน */
+    const out: string[] = strongHnsFrom(text);
     for (const m of text.matchAll(/\d{4,14}/g)) {
         const run = m[0];
         if (run.length <= HN_LENGTH) out.push(padHn(run));
@@ -175,11 +209,12 @@ export const admissionsOf = async (candidates: string[], wardCode: string | null
     const out = new Map<string, AdmissionInfo>();
     const marks = candidates.map(() => '?').join(', ');
     const [rows] = await his.execute<RowDataPacket[]>(
-        `SELECT i.hn, i.an, i.ward, w.name AS ward_name, i.dchstts,
+        `SELECT i.hn, i.an, i.ward, w.name AS ward_name, i.dchstts, ad.bedno,
                 DATE_FORMAT(i.dchdate, '%Y-%m-%d') AS dchdate_text,
                 DATEDIFF(CURDATE(), i.dchdate) AS days_out
          FROM ipt i
          LEFT JOIN ward w ON w.ward = i.ward
+         LEFT JOIN iptadm ad ON ad.an = i.an
          WHERE i.hn IN (${marks})
          ORDER BY i.regdate IS NULL, i.regdate DESC, i.regtime DESC`,
         candidates,
@@ -201,11 +236,12 @@ export const admissionsOf = async (candidates: string[], wardCode: string | null
           หน้าจอเอา AN ของคำตอบที่พยาบาลกดเลือกไปติดกับใบ ถ้าส่งไป ใบวันนี้จะได้ AN ของปีก่อน
         */
         if (admission === 'none') {
-            out.set(hn, { an: null, ward_name: null, admission, discharged_at: null, in_ward: false });
+            out.set(hn, { an: null, bedno: null, ward_name: null, admission, discharged_at: null, in_ward: false });
             continue;
         }
         out.set(hn, {
             an: row.an ? String(row.an) : null,
+            bedno: row.bedno ? (sanitizeHTML(String(row.bedno)) ?? '').trim() || null : null,
             ward_name: row.ward_name ? (sanitizeHTML(String(row.ward_name)) ?? '') : null,
             admission,
             discharged_at: open || !row.dchdate_text ? null : String(row.dchdate_text),
@@ -316,7 +352,7 @@ export const readRxHn = async ({ body, set }: Context) => {
     const wardCode = await hisWardCode(Number(b.ward));
 
     /*
-      อ่านบริเวณที่ HN มักอยู่ก่อน (ขวาล่าง / กลางล่างของใบ — หน้าจอตัดภาพส่งมาเป็น roi)
+      อ่านบริเวณที่ HN มักอยู่ก่อน (แถบล่างสุด + แถบบนสุดของใบ เต็มความกว้าง ต่อกันเป็นภาพเดียว — หน้าจอตัดภาพส่งมาเป็น roi)
       ภาพที่ตัดแล้วมีตัวเลขอื่น (วันที่ ขนาดยา เลขเตียง) ปนน้อยกว่าทั้งหน้ามาก
       และสำคัญกว่านั้น: อ่านทั้งหน้า OCR เรียงเลขจากบนลงล่าง HN ที่อยู่ท้ายใบจึงมักตกเพดาน MAX_CANDIDATES
       เลขจาก roi ได้ที่นั่งก่อนและชนะเมื่อสถานะการนอนเท่ากัน
@@ -324,6 +360,8 @@ export const readRxHn = async ({ body, set }: Context) => {
       ไม่เจอ (ใบรูปแบบอื่น สแกนกลับหัว) ค่อยอ่านทั้งหน้าเหมือนเดิม
     */
     const roiHits = new Set<string>();
+    /* เลขที่ติดคำว่า HN หรือเป็นรูปแบบ 000XXXXXX */
+    const strongHits = new Set<string>();
     let region: 'roi' | 'full' | null = null;
     const sourceOf = new Map<string, Source>();
     let candidates: string[] = [];
@@ -331,17 +369,33 @@ export const readRxHn = async ({ body, set }: Context) => {
 
     const settle = async (ocrHns: string[]) => {
         sourceOf.clear();
-        for (const hn of ocrHns) sourceOf.set(hn, 'ocr');
+        /* กันที่ให้เลขจากบาร์โค้ด/ชั้นข้อความเสมอ ไม่ให้เลขจาก OCR เบียดตกเพดาน */
+        const keep = Math.max(0, MAX_CANDIDATES - fromGiven.length);
+        for (const hn of ocrHns.filter(h => !fromGiven.includes(h)).slice(0, keep)) sourceOf.set(hn, 'ocr');
         // เลขจากบาร์โค้ด/ชั้นข้อความทับของ OCR เสมอ เพราะไม่ได้มาจากการเดารูปตัวอักษร
         for (const hn of fromGiven) sourceOf.set(hn, givenSource);
         candidates = [...sourceOf.keys()].slice(0, MAX_CANDIDATES);
         verified = await verifyAgainstHis(candidates, wardCode);
     };
 
-    if (roiFile && b.file instanceof File) {
+    /*
+      ใบที่มีบาร์โค้ด หน้าจอส่งทั้งเลขจากบาร์โค้ดและภาพมาด้วยกัน
+      บาร์โค้ดบนใบหลายแบบไม่ใช่ HN (เช่นเลขใบสั่ง 12 หลัก) ถ้าหยุดที่บาร์โค้ดจะไม่เคยได้อ่าน "HN 000XXXXXX" บนใบเลย
+      จึงเช็กเลขบาร์โค้ดกับ HIS ก่อน: เป็นผู้ป่วยหอนี้แล้วจบเลย (เร็วเหมือนเดิม) ไม่ใช่ค่อยอ่านภาพต่อ
+    */
+    const givenInWard = async () => {
+        await settle([]);
+        return candidates.some(hn => verified.adm.get(hn)?.in_ward);
+    };
+
+    if (fromGiven.length > 0 && b.file instanceof File && await givenInWard()) {
+        /* เลขจากบาร์โค้ด/ชั้นข้อความเป็นผู้ป่วยหอนี้ ไม่ต้อง OCR */
+    } else if (roiFile && b.file instanceof File) {
         region = 'roi';
-        const fromRoi = hnCandidatesFrom(await ocr(roiFile));
+        const roiText = await ocr(roiFile);
+        const fromRoi = hnCandidatesFrom(roiText);
         for (const hn of fromRoi) roiHits.add(hn);
+        for (const hn of strongHnsFrom(roiText)) strongHits.add(hn);
         await settle(fromRoi);
         const found = candidates.some(hn => roiHits.has(hn) && verified.adm.get(hn)?.in_ward);
         if (!found && !ocrUnavailable) {
@@ -349,12 +403,14 @@ export const readRxHn = async ({ body, set }: Context) => {
             /* roi อ่านพังแต่ทั้งหน้าอ่านได้ ไม่นับว่าล้มเหลว */
             ocrFailed = false;
             ocrText = await ocr(b.file);
+            for (const hn of strongHnsFrom(ocrText)) strongHits.add(hn);
             /* เลขจาก roi นำหน้า แล้วต่อด้วยเลขจากทั้งหน้าที่ยังไม่ซ้ำ */
             await settle([...new Set([...fromRoi, ...hnCandidatesFrom(ocrText)])]);
         }
     } else if (b.file instanceof File) {
         region = 'full';
         ocrText = await ocr(b.file);
+        for (const hn of strongHnsFrom(ocrText)) strongHits.add(hn);
         await settle(hnCandidatesFrom(ocrText));
     } else {
         await settle([]);
@@ -376,7 +432,13 @@ export const readRxHn = async ({ body, set }: Context) => {
             const source = sourceOf.get(hn) ?? 'ocr';
             return {
                 hn,
-                ptname: names.get(hn) ?? '',
+                /*
+                  ส่งชื่อกลับเฉพาะคนที่ส่งใบจากหอนี้ได้ (in_ward)
+                  เลขที่อ่านได้มักเป็นเลขหลง (วันที่ เลขใบสั่ง) ซึ่งตรงกับคนไข้จริงคนอื่นเกือบทุกครั้ง
+                  ไม่ควรเปิดชื่อคนไข้ที่ไม่ได้อยู่ในความดูแลของหอนี้ให้เห็น
+                */
+                ptname: a?.in_ward ? names.get(hn) ?? '' : '',
+                bedno: a?.in_ward ? a.bedno : null,
                 an: a?.an ?? null,
                 ward_name: a?.ward_name ?? null,
                 admission: a?.admission ?? 'none',
@@ -387,6 +449,8 @@ export const readRxHn = async ({ body, set }: Context) => {
         })
         .sort((x, y) => ADMISSION_RANK[x.admission] - ADMISSION_RANK[y.admission]
             || SOURCE_RANK[x.source] - SOURCE_RANK[y.source]
+            /* สถานะเท่ากัน เลขที่ติดคำว่า HN / รูปแบบ 000XXXXXX น่าเชื่อกว่าเลขอื่น */
+            || Number(!strongHits.has(x.hn)) - Number(!strongHits.has(y.hn))
             /* สถานะเท่ากัน เลขที่อยู่ตรงตำแหน่ง HN ของใบน่าเชื่อกว่าเลขที่อยู่กลางใบ */
             || Number(!roiHits.has(x.hn)) - Number(!roiHits.has(y.hn)));
 
@@ -428,16 +492,20 @@ export const listWardPatients = async ({ query, set }: Context) => {
         const hns = rows.map(r => String(r.hn ?? '')).filter(Boolean);
         if (hns.length === 0) return { success: true, data: [] };
         const [adm, names] = await Promise.all([admissionsOf(hns, wardCode), namesOf(hns)]);
+        /* เตียงมากับ admissionsOf (iptadm) แล้ว — พยาบาลจำผู้ป่วยตามเตียงได้เร็วกว่าชื่อ */
         const data = hns
             .filter(hn => adm.get(hn)?.in_ward)
             .map(hn => {
                 const a = adm.get(hn)!;
                 return {
                     hn, ptname: names.get(hn) ?? '', an: a.an, ward_name: a.ward_name,
+                    bedno: a.bedno,
                     admission: a.admission, discharged_at: a.discharged_at, in_ward: true,
                 };
             })
-            .sort((x, y) => ADMISSION_RANK[x.admission] - ADMISSION_RANK[y.admission]
+            /* เรียงตามเตียง น้อยไปมาก (เลขในชื่อเตียงเทียบเป็นตัวเลข 2 มาก่อน 10) · ไม่มีเตียงไว้ท้าย */
+            .sort((x, y) => (x.bedno === null ? 1 : 0) - (y.bedno === null ? 1 : 0)
+                || (x.bedno ?? '').localeCompare(y.bedno ?? '', 'th', { numeric: true })
                 || x.ptname.localeCompare(y.ptname, 'th'));
         return { success: true, data };
     } catch (error) {

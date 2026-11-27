@@ -153,6 +153,7 @@ export const lookupRxPatient = async ({ query, set }: Context) => {
                 hn,
                 ptname: row ? sanitizeHTML(String(row.ptname ?? '')) : '',
                 an: a?.an ?? null,
+                bedno: a?.bedno ?? null,
                 ward_name: a?.ward_name ?? null,
                 admission: a?.admission ?? 'none',
                 discharged_at: a?.discharged_at ?? null,
@@ -281,7 +282,7 @@ export const createRxOrder = async ({ body, user, set }: Context & { user?: unkn
                                    priority, note, submitted_by, submitted_by_name, resend_of, tube_feed)
             VALUES (${ward}, ${hn || null}, ${an || null}, ${hnSource},
                     ${patientName || null}, ${hisVerified}, ${priority},
-                    ${String(b.note ?? '').trim() || null},
+                    ${(sanitizeHTML(String(b.note ?? '').trim()) ?? '').slice(0, 300) || null},
                     ${actor.username}, ${actor.fullname}, ${resendOf}, ${tubeFeed})
             RETURNING rx_order_id
         `;
@@ -377,6 +378,29 @@ export const createRxOrder = async ({ body, user, set }: Context & { user?: unkn
  * ฝั่งหอส่ง ward มาเพื่อดูของตัวเอง ฝั่งห้องยาไม่ส่ง ward จะได้เห็นทุกหอ
  * เรียง stat ขึ้นก่อนเสมอ แล้วค่อยเรียงตามเวลาที่ส่ง
  */
+/**
+ * เติมเตียงปัจจุบันจาก HIS (iptadm.bedno ตาม AN) ให้รายการใบสั่งยา
+ * ไม่เก็บเตียงไว้กับใบ เพราะผู้ป่วยย้ายเตียงได้ คนเดินไปส่งยา/รับยาต้องรู้เตียงที่นอนอยู่ตอนนี้
+ * ถามครั้งเดียวต่อหนึ่งรายการ (AN ไม่ซ้ำ ไม่เกิน 500) · HIS ล่มก็คืนรายการได้ตามปกติ แค่ไม่มีเตียง
+ */
+const withBeds = async <T extends Record<string, unknown>>(rows: T[]): Promise<(T & { bedno: string | null })[]> => {
+    const ans = [...new Set(rows.map(r => r.an).filter((a): a is string => typeof a === 'string' && a.length > 0))];
+    const beds = new Map<string, string>();
+    if (ans.length > 0) {
+        try {
+            const [bedRows] = await his.execute<RowDataPacket[]>(
+                `SELECT an, bedno FROM iptadm WHERE an IN (${ans.map(() => '?').join(',')})`, ans);
+            for (const r of bedRows) {
+                const bed = r.bedno ? (sanitizeHTML(String(r.bedno)) ?? '').trim() : '';
+                if (bed) beds.set(String(r.an), bed);
+            }
+        } catch (error) {
+            console.error('Rx order beds lookup failed:', error);
+        }
+    }
+    return rows.map(r => ({ ...r, bedno: typeof r.an === 'string' ? beds.get(r.an) ?? null : null }));
+};
+
 export const listRxOrders = async ({ query, user, set }: Context & { user?: unknown }) => {
     const actor = await getActor(user);
     if (!actor) return unauthorized(set);
@@ -536,11 +560,50 @@ export const listRxOrders = async ({ query, user, set }: Context & { user?: unkn
                 o.submitted_at ASC
             LIMIT 500
         `;
-        return { success: true, data: rows };
+        return { success: true, data: await withBeds(rows as Record<string, unknown>[]) };
     } catch (error) {
         console.error('List rx orders error:', error);
         set.status = 500;
         return { success: false, message: 'ดึงรายการไม่สำเร็จ' };
+    }
+};
+
+/**
+ * ประวัติแพ้ยาจาก HIS (opd_allergy) ของ HN นี้ — ห้องยาต้องเห็นก่อนจัดยา
+ *
+ * อ่านอย่างเดียว ค้นด้วย hn (คีย์หลักของตาราง)
+ * HIS ล่ม/ค้นไม่ได้ คืน error: true ไม่ใช่รายการว่าง
+ * "ไม่มีประวัติแพ้ยา" กับ "ตรวจสอบไม่ได้" ต้องไม่ดูเหมือนกัน — ถ้าดูเหมือนกัน ห้องยาจะเข้าใจว่าไม่แพ้แล้วจ่ายยาที่แพ้
+ */
+const allergiesOf = async (hn: string | null) => {
+    if (!hn) return { list: [], error: false };
+    try {
+        const [rows] = await his.execute<RowDataPacket[]>(
+            `SELECT oa.agent, oa.symptom, oa.note, DATE_FORMAT(oa.report_date, '%Y-%m-%d') AS report_date,
+                    s.seiousness_name AS seriousness
+             FROM opd_allergy oa
+             LEFT JOIN allergy_seriousness s ON s.seriousness_id = oa.seriousness_id
+             WHERE oa.hn = ?
+             ORDER BY oa.display_order IS NULL, oa.display_order, oa.report_date DESC`,
+            [hn],
+        );
+        const clean = (v: unknown) => (v === null || v === undefined ? null
+            : (sanitizeHTML(String(v)) ?? '').trim() || null);
+        return {
+            list: rows
+                .map(r => ({
+                    agent: clean(r.agent) ?? '',
+                    symptom: clean(r.symptom),
+                    seriousness: clean(r.seriousness),
+                    note: clean(r.note),
+                    report_date: r.report_date ? String(r.report_date) : null,
+                }))
+                .filter(a => a.agent),
+            error: false,
+        };
+    } catch (error) {
+        console.error('Rx allergy lookup failed:', error);
+        return { list: [], error: true };
     }
 };
 
@@ -587,9 +650,16 @@ export const getRxOrder = async ({ params, user, set }: Context & { user?: unkno
             FROM rx_order_events WHERE rx_order_id = ${id} ORDER BY at
         `;
 
+        const allergy = await allergiesOf(rows[0].hn ? String(rows[0].hn) : null);
+
         return {
             success: true,
-            data: { ...rows[0], files, events, file_retention_days: await retentionDays() },
+            data: {
+                ...rows[0], files, events, file_retention_days: await retentionDays(),
+                allergies: allergy.list,
+                /* true = ถาม HIS ไม่ได้ ต่างจากรายการว่าง (ไม่มีประวัติแพ้) */
+                allergy_error: allergy.error,
+            },
         };
     } catch (error) {
         console.error('Get rx order error:', error);

@@ -122,11 +122,11 @@ export const calcNews2 = (input: News2Input): News2Result => {
     if (score >= 7) {
         risk = 'high';
         monitorFreq = 'เฝ้าระวังต่อเนื่อง (continuous)';
-        response = 'ตามทีมฉุกเฉิน/ICU ทันที ประเมินโดยแพทย์ที่มีทักษะเวชบำบัดวิกฤต';
+        response = 'ตาม RRT ทันที (เกณฑ์ รพ. NEWS2 ≥ 5) พิจารณาย้าย ICU ประเมินโดยแพทย์ที่มีทักษะเวชบำบัดวิกฤต';
     } else if (score >= 5) {
         risk = 'medium';
         monitorFreq = 'ทุก 1 ชั่วโมง';
-        response = 'รายงานแพทย์เจ้าของไข้ทันที ประเมินซ้ำโดยทีมที่ดูแลผู้ป่วยเฉียบพลัน';
+        response = 'ตาม RRT (เกณฑ์ รพ. NEWS2 ≥ 5) และรายงานแพทย์เจ้าของไข้ทันที คัดกรอง sepsis (qSOFA)';
     } else if (hasSingleThree) {
         risk = 'low_medium';
         monitorFreq = 'อย่างน้อยทุก 1 ชั่วโมง';

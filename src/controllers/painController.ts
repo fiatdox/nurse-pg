@@ -97,62 +97,42 @@ export const getPainRecordsByAN = async ({ params, query, set }: Context) => {
     }
 };
 
-// ---------- บันทึกการประเมินความปวด ----------
-export const savePainRecord = async ({ body, set, user }: Context & { user: any }) => {
-    const payload = (body ?? {}) as Record<string, unknown>;
-    const an = String(payload.an ?? '').trim();
-
-    if (!an) {
-        set.status = 400;
-        return { success: false, message: 'กรุณาระบุ an' };
-    }
-    if (!String(payload.ward_code ?? '').trim()) {
-        set.status = 400;
-        return { success: false, message: 'กรุณาระบุ ward_code' };
-    }
+/**
+ * ตรวจค่าจากฟอร์มแล้วสร้างแถวที่จะเขียน — ใช้ร่วมกันทั้งบันทึกใหม่และแก้ไข จะได้มีกติกาเดียว
+ * คืน string = ข้อความผิดพลาด (400)
+ */
+const buildPainValues = (payload: Record<string, unknown>):
+    { values: Record<string, unknown>; cpot: boolean } | string => {
+    if (!String(payload.ward_code ?? '').trim()) return 'กรุณาระบุ ward_code';
 
     const nurseName = String(payload.nurse_name ?? '').trim();
-    if (!nurseName) {
-        set.status = 400;
-        return { success: false, message: 'กรุณาระบุชื่อพยาบาลผู้ประเมิน' };
-    }
+    if (!nurseName) return 'กรุณาระบุชื่อพยาบาลผู้ประเมิน';
 
     const tool = String(payload.assessment_tool ?? 'NRS').trim() || 'NRS';
-    if (!VALID_TOOLS.includes(tool)) {
-        set.status = 400;
-        return { success: false, message: 'เครื่องมือประเมินไม่ถูกต้อง' };
-    }
+    if (!VALID_TOOLS.includes(tool)) return 'เครื่องมือประเมินไม่ถูกต้อง';
 
     // CPOT: คะแนนรวมคำนวณที่ server จากรายด้าน ไม่เชื่อ pain_score ที่ส่งมา
     let cpot: { items: Record<string, unknown>; total: number } | null = null;
     if (tool === 'CPOT') {
         const r = parseCpot(payload.tool_items);
-        if (typeof r === 'string') {
-            set.status = 400;
-            return { success: false, message: r };
-        }
+        if (typeof r === 'string') return r;
         cpot = r;
     }
     const maxScore = cpot ? 8 : 10;
 
     const score = cpot ? cpot.total : Number(payload.pain_score);
     if (!Number.isInteger(score) || score < 0 || score > maxScore) {
-        set.status = 400;
-        return { success: false, message: `คะแนนความปวดต้องเป็นจำนวนเต็ม 0–${maxScore}` };
+        return `คะแนนความปวดต้องเป็นจำนวนเต็ม 0–${maxScore}`;
     }
 
     const reassess = payload.reassess_score;
     const reassessScore =
         reassess === null || reassess === undefined || reassess === '' ? null : Number(reassess);
     if (reassessScore !== null && (!Number.isInteger(reassessScore) || reassessScore < 0 || reassessScore > maxScore)) {
-        set.status = 400;
-        return { success: false, message: `คะแนนหลังประเมินซ้ำต้องเป็นจำนวนเต็ม 0–${maxScore}` };
+        return `คะแนนหลังประเมินซ้ำต้องเป็นจำนวนเต็ม 0–${maxScore}`;
     }
 
     const recordDatetime = toLocalDate(payload.record_datetime) ?? new Date();
-    const shift = shiftOfTime(recordDatetime);
-
-    const actor = String(user?.username ?? payload.staff_id ?? '') || null;
 
     // รับเฉพาะคอลัมน์ที่รู้จัก และแปลงค่าว่างเป็น null ให้ตรงกับชนิดคอลัมน์
     const values: Record<string, unknown> = {};
@@ -163,13 +143,35 @@ export const savePainRecord = async ({ body, set, user }: Context & { user: any 
     values.staff_id = String(payload.staff_id ?? '') || '';
     values.nurse_name = nurseName;
     values.record_datetime = recordDatetime;
-    values.shift = shift;
+    values.shift = shiftOfTime(recordDatetime);
     values.assessment_tool = tool;
     values.pain_score = score;
     values.pain_level = cpot ? cpotLevel(score) : levelOfScore(score);
     values.reassess_score = reassessScore;
     // ใส่คอลัมน์นี้เฉพาะ CPOT — เครื่องมืออื่นยังบันทึกได้แม้ยังไม่ได้รัน sql เพิ่มคอลัมน์
+    // (แก้ไขจาก CPOT เป็นเครื่องมืออื่น: ล้างรายด้านเดิมทิ้ง ไม่ให้ค้างคู่กับคะแนนใหม่)
     if (cpot) values.tool_items = nurse.json(cpot.items as never);
+    return { values, cpot: !!cpot };
+};
+
+// ---------- บันทึกการประเมินความปวด ----------
+export const savePainRecord = async ({ body, set, user }: Context & { user: any }) => {
+    const payload = (body ?? {}) as Record<string, unknown>;
+    const an = String(payload.an ?? '').trim();
+
+    if (!an) {
+        set.status = 400;
+        return { success: false, message: 'กรุณาระบุ an' };
+    }
+    const built = buildPainValues(payload);
+    if (typeof built === 'string') {
+        set.status = 400;
+        return { success: false, message: built };
+    }
+    const { values } = built;
+    const cpot = built.cpot;
+
+    const actor = String(user?.username ?? payload.staff_id ?? '') || null;
 
     try {
         // ทุกครั้งที่ประเมินคือแถวใหม่ ประวัติความปวดต้องเห็นแนวโน้มย้อนหลังได้
@@ -196,6 +198,73 @@ export const savePainRecord = async ({ body, set, user }: Context & { user: any 
             return { success: false, message: 'ฐานข้อมูลยังไม่รองรับ CPOT (ต้องรัน sql/2026-11-26_pain_cpot.sql)' };
         }
         console.error('Save pain record error:', error);
+        set.status = 500;
+        return { success: false, message: 'Internal Server Error' };
+    }
+};
+
+// ---------- แก้ไขการประเมินความปวด ----------
+/**
+ * แก้แถวเดิม (เช่น ลงคะแนนผิด เติมการจัดการ/คะแนนประเมินซ้ำทีหลัง) — ไม่สร้างแถวใหม่ กราฟจะไม่มีจุดซ้ำ
+ * ต้องส่ง an มาด้วยและต้องตรงกับแถว กันแก้ผิดคน · an/created_* ไม่เปลี่ยน
+ */
+export const updatePainRecord = async ({ params, body, set, user }: Context & { user: any }) => {
+    const recordId = Number((params as { id: string }).id);
+    if (!Number.isInteger(recordId) || recordId <= 0) {
+        set.status = 400;
+        return { success: false, message: 'id ไม่ถูกต้อง' };
+    }
+    const payload = (body ?? {}) as Record<string, unknown>;
+    const an = String(payload.an ?? '').trim();
+    if (!an) {
+        set.status = 400;
+        return { success: false, message: 'กรุณาระบุ an' };
+    }
+    const built = buildPainValues(payload);
+    if (typeof built === 'string') {
+        set.status = 400;
+        return { success: false, message: built };
+    }
+    const values = { ...built.values };
+    if (!built.cpot) values.tool_items = null;
+
+    const actor = String(user?.username ?? payload.staff_id ?? '') || null;
+
+    try {
+        const run = (v: Record<string, unknown>) => nurse`
+            UPDATE nursing_pain_records
+            SET ${nurse({ ...v, updated_at: new Date(), updated_by: actor })}
+            WHERE id = ${recordId}
+              AND an = ${an}
+              AND is_deleted IS NOT TRUE
+            RETURNING *
+        `;
+        let saved;
+        try {
+            saved = await run(values);
+        } catch (error) {
+            // ยังไม่มีคอลัมน์ tool_items (ยังไม่ได้รัน sql CPOT) และไม่ใช่ CPOT: แก้โดยไม่แตะคอลัมน์นี้
+            if ((error as { code?: string })?.code === '42703' && !built.cpot) {
+                const { tool_items: _drop, ...rest } = values;
+                saved = await run(rest);
+            } else throw error;
+        }
+        if (saved.length === 0) {
+            set.status = 404;
+            return { success: false, message: 'ไม่พบรายการที่ต้องการแก้ไข (อาจถูกลบไปแล้ว)' };
+        }
+        return {
+            success: true,
+            message: 'แก้ไขการประเมินความปวดเรียบร้อยแล้ว',
+            data: sanitizeRow(saved[0] as Record<string, unknown>),
+        };
+    } catch (error) {
+        const code = (error as { code?: string })?.code;
+        if (built.cpot && (code === '42703' || code === '23514')) {
+            set.status = 503;
+            return { success: false, message: 'ฐานข้อมูลยังไม่รองรับ CPOT (ต้องรัน sql/2026-11-26_pain_cpot.sql)' };
+        }
+        console.error('Update pain record error:', error);
         set.status = 500;
         return { success: false, message: 'Internal Server Error' };
     }
